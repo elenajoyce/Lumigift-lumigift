@@ -338,6 +338,20 @@ Subscribe on the status page to receive incident notifications.
 
 ---
 
+## API Documentation
+
+Auto-generated API reference docs are published to GitHub Pages on every push to `main`:
+
+**📚 [https://joekeyz8.github.io/Lumigift-lumigift/](https://joekeyz8.github.io/Lumigift-lumigift/)**
+
+The docs are generated with [TypeDoc](https://typedoc.org/) from `src/lib` and `src/server/services` (app routes are excluded). To regenerate them locally:
+
+```bash
+npx typedoc
+```
+
+---
+
 ## Contributing
 
 We welcome contributions! Please read the [Contributor Onboarding Guide](CONTRIBUTING.md) before opening a PR — it walks you through setup, architecture, testing, and the first-contribution workflow.
