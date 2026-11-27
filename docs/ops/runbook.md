@@ -4,7 +4,7 @@ This runbook provides procedures for handling common production incidents in Lum
 
 ## General Guidelines
 
-- **Alert Channels**: Incidents are alerted via Vercel monitoring, DataDog, or manual reports
+- **Alert Channels**: Incidents are alerted via PagerDuty (Sentry and CloudWatch integrations), Vercel monitoring, or manual reports
 - **Response Times**:
   - P0 (Critical): <15 minutes
   - P1 (High): <1 hour
@@ -13,7 +13,6 @@ This runbook provides procedures for handling common production incidents in Lum
 - **Post-Mortem**: Conduct blameless post-mortem for all P0/P1 incidents
 - **Logs Dashboard**: Grafana Explore (Loki) at `${GRAFANA_URL}/explore` — see [Log Aggregation](#log-aggregation)
 - **SLO Dashboard**: Grafana SLO overview (availability, p95 latency, payment success rate, error-budget burn rate) at `${GRAFANA_URL}/d/lumigift-slo` — see [SLO Dashboards](./slo-dashboards.md)
-=======
 
 ## Database Connection Failure
 
@@ -40,7 +39,8 @@ This runbook provides procedures for handling common production incidents in Lum
 
 2. **Database Instance Down**:
    - Restart database instance via cloud provider console
-   - If restart fails, restore from latest backup
+   - If restart fails, restore from latest backup — follow the restore drill
+     procedure in [database-backup.md](./database-backup.md) (RTO < 1 hour)
    - Update DNS/connection strings if instance migrated
 
 3. **Network Issues**:
@@ -51,7 +51,9 @@ This runbook provides procedures for handling common production incidents in Lum
 ### Escalation Path
 
 - If database unrecoverable: Escalate to engineering lead for data restoration
+  (see [database-backup.md](./database-backup.md) for the backup/restore drill)
 - If widespread outage: Escalate to CTO for customer communication
+- Page the on-call engineer via PagerDuty per [On-Call & Escalation](#on-call--escalation)
 
 ## Redis Outage
 

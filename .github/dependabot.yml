@@ -19,7 +19,7 @@ updates:
     # Dependabot will update pinned commit SHAs and keep the # vX comment in sync
 
   - package-ecosystem: "cargo"
-    directory: "/contracts/escrow"
+    directory: "/contracts"
     schedule:
       interval: "weekly"
     labels:
