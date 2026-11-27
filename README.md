@@ -329,6 +329,15 @@ Subscribe on the status page to receive incident notifications.
 
 ---
 
+## Documentation
+
+- **Local development setup** — [docs/local-dev-setup.md](docs/local-dev-setup.md), including the [Windows/WSL2 guide](docs/local-dev-setup.md#windows--wsl2-setup)
+- **Incident response playbook** — [docs/ops/incident-response.md](docs/ops/incident-response.md)
+- **Privacy & data retention** — [docs/privacy-data-retention.md](docs/privacy-data-retention.md), including the [NDPR subject access request (SAR) procedure](docs/privacy-data-retention.md#subject-access-request-sar-process)
+- **Architecture decision records** — [docs/adr/README.md](docs/adr/README.md)
+
+---
+
 ## Contributing
 
 We welcome contributions! Please read the [Contributor Onboarding Guide](CONTRIBUTING.md) before opening a PR — it walks you through setup, architecture, testing, and the first-contribution workflow.
@@ -336,6 +345,7 @@ We welcome contributions! Please read the [Contributor Onboarding Guide](CONTRIB
 - Bug reports → [Bug Report template](.github/ISSUE_TEMPLATE/bug_report.md)
 - Feature requests → [Feature Request template](.github/ISSUE_TEMPLATE/feature_request.md)
 - Security issues → **security@lumigift.com** (do not open public issues)
+- Windows/WSL2 contributors → see the [WSL2 setup guide](docs/local-dev-setup.md#windows--wsl2-setup)
 
 ---
 
