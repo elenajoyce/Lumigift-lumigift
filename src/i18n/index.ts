@@ -57,5 +57,13 @@ export const SUPPORTED_LOCALES: Array<{ code: Locale; label: string; nativeLabel
   { code: "yo", label: "Yoruba", nativeLabel: "Yorùbá" },
 ];
 
+/** True when the given locale is one of the selectable locales above. */
+export function isSupportedLocale(value: unknown): value is Locale {
+  return (
+    typeof value === "string" &&
+    SUPPORTED_LOCALES.some((entry) => entry.code === value)
+  );
+}
+
 export const DEFAULT_LOCALE: Locale = "en";
 export const LOCALE_STORAGE_KEY = "lumigift_locale";

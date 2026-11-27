@@ -4,7 +4,15 @@ import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { useCsrf } from "@/hooks/useCsrf";
 
-export function FulfilWishButton({ slug }: { slug: string }) {
+export function FulfilWishButton({
+  slug,
+  className,
+  fullWidth = false,
+}: {
+  slug: string;
+  className?: string;
+  fullWidth?: boolean;
+}) {
   const [error, setError] = useState<string | null>(null);
   const { csrfFetch } = useCsrf();
 
@@ -26,17 +34,36 @@ export function FulfilWishButton({ slug }: { slug: string }) {
     onError: (err: Error) => setError(err.message),
   });
 
+  const buttonClasses = [
+    "btn",
+    "btn--primary",
+    "btn--lg",
+    fullWidth ? "btn--block" : "",
+    className ?? "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
   return (
-    <>
+    <div className={fullWidth ? "w-full" : undefined}>
       <button
         type="button"
-        className="btn btn--primary"
+        className={buttonClasses}
+        style={{ minHeight: "44px", minWidth: "44px" }}
         disabled={isPending}
+        aria-busy={isPending}
         onClick={() => mutate()}
       >
         {isPending ? "Starting…" : "Fulfil this wish"}
       </button>
-      {error && <p role="alert">{error}</p>}
-    </>
+      <p
+        role="alert"
+        aria-live="assertive"
+        className="form-error"
+        style={error ? { marginTop: "0.5rem" } : { display: "none" }}
+      >
+        {error}
+      </p>
+    </div>
   );
 }

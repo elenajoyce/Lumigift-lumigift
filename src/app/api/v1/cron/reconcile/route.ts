@@ -13,6 +13,7 @@ import { NextRequest, NextResponse } from "next/server";
 import {
   reconcilePendingPayments,
   getDeadLetteredGiftIds,
+  getUnresolvedReconciliationErrors,
 } from "@/server/services/payment-reconciliation.service";
 import {
   recordCronSuccess,
@@ -22,6 +23,8 @@ import {
 import type { ApiResponse } from "@/types";
 import type { ReconcileResult } from "@/server/services/payment-reconciliation.service";
 import { isAuthorizedCronRequest } from "@/server/cron-auth";
+import { withErrorHandler } from "@/server/middleware";
+import { requestLogger, getCorrelationId } from "@/lib/logger";
 
 /** Ping a dead-man's-switch URL (e.g. Healthchecks.io / BetterUptime). */
 async function pingHealthcheck(suffix = "") {
@@ -34,8 +37,11 @@ async function pingHealthcheck(suffix = "") {
   }
 }
 
-export const GET = async (req: NextRequest) => {
+// Wrapped with `withErrorHandler` so every response carries a
+// request/correlation ID and is logged against it (#509).
+export const GET = withErrorHandler(async (req: NextRequest) => {
   const authHeader = req.headers.get("authorization");
+  const log = requestLogger(getCorrelationId(req.headers));
   if (!isAuthorizedCronRequest(authHeader)) {
     return NextResponse.json<ApiResponse<never>>(
       { success: false, error: "Unauthorized" },
@@ -44,40 +50,47 @@ export const GET = async (req: NextRequest) => {
   }
 
   const startedAt = Date.now();
-  console.log("[cron/reconcile] run started", { startedAt: new Date(startedAt).toISOString() });
+  log.info({ startedAt: new Date(startedAt).toISOString() }, "[cron/reconcile] run started");
 
   try {
     const result = await reconcilePendingPayments();
     const deadLettered = await getDeadLetteredGiftIds();
+    const unresolvedErrors = await getUnresolvedReconciliationErrors();
     const durationMs = Date.now() - startedAt;
 
-    console.log("[cron/reconcile] run complete", {
-      ...result,
-      durationMs,
-      deadLetteredTotal: deadLettered.length,
-    });
+    log.info(
+      { ...result, durationMs, deadLetteredTotal: deadLettered.length },
+      "[cron/reconcile] run complete"
+    );
 
-    await pingHealthcheck(); // success ping
+    await pingCronHealthcheck("reconcile"); // success ping (after completion)
 
     return NextResponse.json<
-      ApiResponse<ReconcileResult & { durationMs: number; deadLetteredTotal: number }>
+      ApiResponse<
+        ReconcileResult & {
+          durationMs: number;
+          deadLetteredTotal: number;
+          unresolvedReconciliationErrors: number;
+        }
+      >
     >({
       success: true,
       data: {
         ...result,
         durationMs,
         deadLetteredTotal: deadLettered.length,
+        unresolvedReconciliationErrors: unresolvedErrors.length,
       },
     });
   } catch (err) {
     const durationMs = Date.now() - startedAt;
-    console.error("[cron/reconcile] run failed", err);
+    log.error({ err, durationMs }, "[cron/reconcile] run failed");
     recordCronFailure("cron/v1/reconcile", durationMs, err);
     await recordDeadLetter("cron/v1/reconcile", durationMs, err);
-    await pingHealthcheck("/fail"); // failure ping
+    await pingCronHealthcheck("reconcile", "/fail"); // failure ping
     return NextResponse.json<ApiResponse<never>>(
       { success: false, error: "Reconciliation job failed" },
       { status: 500 }
     );
   }
-};
+});

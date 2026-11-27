@@ -26,6 +26,20 @@ const STEP_UNLOCK = 3;
 const STEP_REVIEW = 4;
 
 /**
+ * Human-readable labels for form fields, used in the validation error summary.
+ */
+const FIELD_LABELS: Partial<Record<keyof CreateGiftFormInput, string>> = {
+  recipientName: "Recipient's Name",
+  recipientPhone: "Recipient's Phone",
+  recipientEmail: "Recipient's Email",
+  amountNgn: "Gift Amount",
+  message: "Personal Message",
+  unlockAt: "Unlock Date & Time",
+  paymentProvider: "Payment Method",
+  themeId: "Theme",
+};
+
+/**
  * Outcome of the last mutation attempt.
  *
  * - `idle`    — no submission yet.
@@ -37,6 +51,35 @@ const STEP_REVIEW = 4;
  */
 type MutationOutcome = "idle" | "pending" | "unknown" | "error" | "success";
 
+/**
+ * Converts a datetime value to an ISO 8601 UTC string.
+ *
+ * `DateTimeInput` already produces UTC ISO strings, but drafts restored from
+ * localStorage (or values typed by other means) may be local-time strings.
+ * Parsing with `new Date()` interprets offset-less strings as local time, so
+ * the resulting `toISOString()` is always UTC.
+ */
+function toUtcIsoString(value: string | undefined | null): string {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toISOString();
+}
+
+/**
+ * Formats a UTC ISO string as the user's local date/time, including a
+ * timezone indicator (e.g. "1 Jan 2025, 13:00 GMT+1").
+ */
+function formatLocalDateTime(utcIso: string): string {
+  const parsed = new Date(utcIso);
+  if (Number.isNaN(parsed.getTime())) return utcIso;
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZoneName: "short",
+  }).format(parsed);
+}
+
 export function GiftWizard() {
   const { draft, saveDraft, clearDraft } = useGiftDraft();
   const {
@@ -46,7 +89,9 @@ export function GiftWizard() {
     getValues,
     setValue,
     watch,
+    reset,
     formState: { errors },
+    reset,
   } = useForm<CreateGiftFormInput>({
     resolver: zodResolver(createGiftSchema),
     defaultValues: {
@@ -61,6 +106,9 @@ export function GiftWizard() {
     mode: "onTouched",
   });
 
+  // Track whether we've shown the restore draft banner
+  const [showRestoreBanner, setShowRestoreBanner] = useState(false);
+
   // Initialise step from draft (if available) so the wizard resumes after refresh.
   // Also re-sync step and form values whenever the draft changes — this covers
   // both the initial localStorage load (mount) and cross-tab storage events.
@@ -68,6 +116,16 @@ export function GiftWizard() {
 
   useEffect(() => {
     if (!draft) return;
+    // Show restore banner on mount if there's a draft with meaningful data
+    const hasMeaningfulData =
+      draft.recipientName ||
+      draft.recipientEmail ||
+      draft.amountNgn ||
+      draft.message ||
+      draft.unlockAt;
+    if (hasMeaningfulData) {
+      setShowRestoreBanner(true);
+    }
     // Never restore directly to the review step — require the user to complete
     // the flow again so no stale data is submitted.
     if (draft.step > STEP_OCCASION && draft.step < STEP_REVIEW) {
@@ -105,6 +163,27 @@ export function GiftWizard() {
       unlockAt: values.unlockAt,
       paymentProvider: values.paymentProvider,
     });
+  }
+
+  /** Accept the restored draft — keep the data and dismiss the banner. */
+  function acceptDraft() {
+    setShowRestoreBanner(false);
+  }
+
+  /** Discard the restored draft — clear localStorage and reset form. */
+  function discardDraft() {
+    clearDraft();
+    reset({
+      paymentProvider: "paystack",
+      recipientIsRegistered: false,
+      recipientName: "",
+      recipientEmail: "",
+      amountNgn: undefined,
+      message: "",
+      unlockAt: "",
+    });
+    setStep(STEP_OCCASION);
+    setShowRestoreBanner(false);
   }
 
   function handleTemplateSelect(tpl: GiftTemplate) {
@@ -145,6 +224,13 @@ export function GiftWizard() {
       // Track whether we received any HTTP response before a potential error
       let responseReceived = false;
 
+      // DateTimeInput already emits an ISO 8601 UTC string (e.g. "2025-01-01T12:00:00.000Z").
+      // Normalise defensively so the backend always receives UTC, never a local-time string.
+      const payload: CreateGiftFormInput = {
+        ...data,
+        unlockAt: toUtcIsoString(data.unlockAt),
+      };
+
       try {
         const res = await fetch("/api/gifts", {
           method: "POST",
@@ -154,7 +240,7 @@ export function GiftWizard() {
             // preventing a second gift from being created on reconnect.
             "Idempotency-Key": idempotencyKeyRef.current,
           },
-          body: JSON.stringify(data),
+          body: JSON.stringify(payload),
         });
 
         responseReceived = true;
@@ -209,6 +295,26 @@ export function GiftWizard() {
 
   return (
     <div className={styles.wrapper}>
+      {/* Restore draft banner — shown on mount if a draft exists in localStorage */}
+      {showRestoreBanner && (
+        <div
+          className={styles.restoreBanner}
+          role="status"
+          aria-live="polite"
+          aria-label="Draft restoration options"
+        >
+          <p className={styles.restoreMessage}>
+            You have a saved draft from a previous session. Would you like to restore it?
+          </p>
+          <div className={styles.restoreActions}>
+            <Button variant="secondary" onClick={discardDraft}>
+              Discard
+            </Button>
+            <Button onClick={acceptDraft}>Restore</Button>
+          </div>
+        </div>
+      )}
+
       {step > STEP_OCCASION && <WizardProgress currentStep={step} />}
 
       {/* Offline / reconnect banner — scoped to the review step where the
@@ -302,6 +408,11 @@ export function GiftWizard() {
             error={errors.unlockAt?.message}
             required
           />
+          {getValues("unlockAt") && (
+            <p className={styles.localTimeHint} role="note">
+              Your local time: {formatLocalDateTime(getValues("unlockAt"))}
+            </p>
+          )}
           <div className={styles.nav}>
             <Button variant="secondary" onClick={back}>
               Back

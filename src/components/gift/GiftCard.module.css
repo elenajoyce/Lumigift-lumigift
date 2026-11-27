@@ -2,7 +2,8 @@
   background-color: var(--color-bg-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-xl);
-  padding: var(--space-6);
+  /* Fluid padding: comfortable on wide screens, compact on small ones */
+  padding: clamp(var(--space-3), 4vw, var(--space-6));
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
@@ -10,8 +11,11 @@
     border-color var(--transition-base),
     box-shadow var(--transition-base);
   cursor: pointer;
-  /* Prevent the card itself from creating horizontal overflow */
+  /* Prevent the card from creating horizontal overflow on narrow viewports */
   min-width: 0;
+  /* Fluid width: fills its grid cell but never shrinks below 280px content */
+  width: 100%;
+  box-sizing: border-box;
   overflow: hidden;
 }
 
@@ -48,9 +52,12 @@
 }
 
 .amount {
-  font-size: var(--text-2xl);
+  font-size: clamp(var(--text-lg), 5vw, var(--text-2xl));
   font-weight: var(--font-bold);
   color: var(--color-text-primary);
+  /* Prevent long currency amounts from overflowing */
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
 
 .hidden {
@@ -112,4 +119,11 @@
 .reaction span {
   font-size: 1.5rem;
   margin-right: 0.25rem;
+}
+
+/* Ensure all interactive children inside the card meet 44×44px touch targets */
+.card button,
+.card a {
+  min-height: 44px;
+  min-width: 44px;
 }

@@ -4,7 +4,7 @@ This runbook provides procedures for handling common production incidents in Lum
 
 ## General Guidelines
 
-- **Alert Channels**: Incidents are alerted via Vercel monitoring, DataDog, or manual reports
+- **Alert Channels**: Incidents are alerted via PagerDuty (Sentry and CloudWatch integrations), Vercel monitoring, or manual reports
 - **Response Times**:
   - P0 (Critical): <15 minutes
   - P1 (High): <1 hour
@@ -12,6 +12,7 @@ This runbook provides procedures for handling common production incidents in Lum
 - **Communication**: Update stakeholders via Slack #incidents channel
 - **Post-Mortem**: Conduct blameless post-mortem for all P0/P1 incidents
 - **Logs Dashboard**: Grafana Explore (Loki) at `${GRAFANA_URL}/explore` — see [Log Aggregation](#log-aggregation)
+- **SLO Dashboard**: Grafana SLO overview (availability, p95 latency, payment success rate, error-budget burn rate) at `${GRAFANA_URL}/d/lumigift-slo` — see [SLO Dashboards](./slo-dashboards.md)
 
 ## Database Connection Failure
 
@@ -38,7 +39,8 @@ This runbook provides procedures for handling common production incidents in Lum
 
 2. **Database Instance Down**:
    - Restart database instance via cloud provider console
-   - If restart fails, restore from latest backup
+   - If restart fails, restore from latest backup — follow the restore drill
+     procedure in [database-backup.md](./database-backup.md) (RTO < 1 hour)
    - Update DNS/connection strings if instance migrated
 
 3. **Network Issues**:
@@ -49,7 +51,9 @@ This runbook provides procedures for handling common production incidents in Lum
 ### Escalation Path
 
 - If database unrecoverable: Escalate to engineering lead for data restoration
+  (see [database-backup.md](./database-backup.md) for the backup/restore drill)
 - If widespread outage: Escalate to CTO for customer communication
+- Page the on-call engineer via PagerDuty per [On-Call & Escalation](#on-call--escalation)
 
 ## Redis Outage
 
@@ -162,88 +166,315 @@ This runbook provides procedures for handling common production incidents in Lum
 - If Paystack API issues: Contact Paystack support
 - If widespread payment failures: Escalate to CTO for payment provider communication
 
-## Cron Job Failure
+## Cron Job Failures
 
-### Symptoms
+Lumigift runs four scheduled jobs. Each has its own section below covering
+**how to verify the job ran**, **common failure reasons**, and a **manual retry
+procedure**. All cron routes are `GET` endpoints protected by `CRON_SECRET`
+(sent as `Authorization: Bearer $CRON_SECRET`).
 
-- Gifts don't unlock on schedule
-- Expiry processing doesn't run
-- Application logs missing cron execution entries
-- Vercel cron dashboard shows failures
-- `cron.dead_letter` structured log entries or Redis keys `cron:dead-letter:*` present
+### Shared Cron Concepts
 
-### Diagnosis Steps
+**Schedules** (configured in `vercel.json`):
 
-1. Check Vercel cron job status and logs in the project dashboard.
-2. Verify cron schedule configuration in `vercel.json`.
-3. Check for `cron.dead_letter` error logs (structured field `metric=cron.dead_letter`).
-4. Inspect Redis dead-letter keys: `redis-cli keys "cron:dead-letter:*"`.
-5. Test cron endpoints manually (see Manual Re-Trigger below).
-6. Check for long-running cron jobs blocking new executions.
-7. Verify database connectivity from cron functions.
+| Job                  | Route                          | Schedule            | Max expected duration |
+| -------------------- | ------------------------------ | ------------------- | --------------------- |
+| Unlock scheduler     | `/api/v1/cron/unlock`          | every minute        | < 30 s                |
+| Gift expire          | `/api/v1/cron/expire`          | daily at 02:00 UTC  | < 5 min               |
+| Payment reconcile    | `/api/v1/cron/reconcile`       | every 6 hours       | < 10 min              |
+| Occasion reminders   | `/api/v1/cron/occasion-reminders` | daily at 08:00 UTC | < 5 min             |
+| Event indexer        | `/api/v1/cron/index-events`    | every 5 minutes     | < 2 min               |
 
-### Manual Re-Trigger
+**Structured logs** — every run emits a `cron.run` log line with fields
+`job`, `status` (`ok`/`error`), `durationMs`, and `processed`. Failures emit
+`cron.dead_letter` with `metric=cron.dead_letter`. Query in Grafana Explore:
 
-Each cron route is a standard `GET` endpoint protected by `CRON_SECRET`. Re-trigger
-any job with `curl`:
-
-```bash
-# Unlock — every minute
-curl -X GET "https://lumigift.app/api/v1/cron/unlock" \
-  -H "Authorization: Bearer $CRON_SECRET"
-
-# Expire — daily at 02:00 UTC
-curl -X GET "https://lumigift.app/api/v1/cron/expire" \
-  -H "Authorization: Bearer $CRON_SECRET"
-
-# Reconcile — every 6 hours
-curl -X GET "https://lumigift.app/api/v1/cron/reconcile" \
-  -H "Authorization: Bearer $CRON_SECRET"
-
-# Index events — every 5 minutes
-curl -X GET "https://lumigift.app/api/v1/cron/index-events" \
-  -H "Authorization: Bearer $CRON_SECRET"
+```logql
+{service="lumigift"} | json | metric = "cron.run"
+{service="lumigift"} | json | metric = "cron.dead_letter"
 ```
 
-A `200` response means the job completed. A `401` means `CRON_SECRET` is wrong or
-missing. A `500` means the job threw — check the `cron.run` / `cron.dead_letter`
-logs and Sentry for the error, then re-trigger after fixing the cause.
-
-Dead-letter payloads are retained in Redis for 7 days and can be inspected to
-identify which job failed and why:
+**Dead-letter store** — failed payloads are retained in Redis for 7 days:
 
 ```bash
+redis-cli keys "cron:dead-letter:*"
 redis-cli get "cron:dead-letter:cron/v1/unlock"
 ```
 
-### Resolution Steps
+**Healthcheck pings** — each job pings its healthcheck endpoint on success
+(`CRON_HEALTHCHECK_URL_<JOB>`). A missing ping for longer than the job's
+schedule interval is the primary alert signal.
 
-1. **Cron Function Errors**:
-   - Fix code issues and redeploy.
-   - Re-trigger the missed job manually (above).
-   - Manually apply missed work via the admin interface if needed.
+**Response codes** — `200` = job completed; `401` = `CRON_SECRET` wrong or
+missing; `500` = job threw (check `cron.run` / `cron.dead_letter` logs and
+Sentry, fix the cause, then re-trigger).
 
-2. **Schedule Issues**:
-   - Update cron expressions in `vercel.json` / Vercel dashboard.
-   - Adjust timezone settings if needed.
+---
 
-3. **Timeout Issues**:
-   - Optimize cron job performance.
-   - Split large jobs into batches.
+### Unlock Scheduler (`/api/v1/cron/unlock`)
 
-4. **Dead-Letter Recovery**:
-   - Review the dead-letter payload in Redis/Sentry.
-   - Fix the underlying failure.
-   - Re-trigger the specific job manually via curl.
+Unlocks gifts whose `unlock_time` has passed and submits the on-chain unlock.
 
-### Escalation Path
+#### Verify the job ran
+
+1. Logs: `{service="lumigift"} | json | metric = "cron.run" | job = "unlock"`
+   — expect one entry per minute with `status="ok"`.
+2. Healthcheck: confirm a ping within the last 2 minutes at the unlock
+   healthcheck endpoint.
+3. DB state — no gift should remain locked past its unlock time:
+   ```sql
+   SELECT count(*) FROM gifts
+   WHERE status = 'locked' AND unlock_time < NOW() - INTERVAL '5 minutes';
+   ```
+   A non-zero count after 5 minutes indicates the scheduler is not running.
+4. Vercel cron dashboard shows successful invocations for the last hour.
+
+#### Common failure reasons
+
+- `CRON_SECRET` rotated but not updated in Vercel env → `401` on every run.
+- Database connection pool exhausted → `500`, `ConnectionError` in logs.
+- Stellar RPC latency/timeouts → unlock transactions queued but not submitted.
+- Long-running run overlapping the next minute (lock contention).
+- Dead-letter entries present: `redis-cli keys "cron:dead-letter:*unlock*"`.
+
+#### Manual retry
+
+```bash
+curl -X GET "https://lumigift.app/api/v1/cron/unlock" \
+  -H "Authorization: Bearer $CRON_SECRET"
+```
+
+Then re-run the DB check above; it should return `0`. If specific gifts remain
+locked, inspect the dead-letter payload for that run and escalate.
+
+---
+
+### Gift Expire (`/api/v1/cron/expire`)
+
+Expires unclaimed gifts past their expiry window and triggers refunds.
+
+#### Verify the job ran
+
+1. Logs: `{service="lumigift"} | json | metric = "cron.run" | job = "expire"`
+   — expect one entry per day shortly after 02:00 UTC.
+2. Healthcheck: confirm a ping within the last 26 hours.
+3. DB state — no gift should remain unexpired past its window:
+   ```sql
+   SELECT count(*) FROM gifts
+   WHERE status = 'locked' AND expires_at < NOW() - INTERVAL '1 hour';
+   ```
+4. Vercel cron dashboard shows a successful invocation for today.
+
+#### Common failure reasons
+
+- Job exceeded the function timeout on a large backlog → partial run, `500`.
+- Refund transaction failures (Stellar network issues) → gifts marked
+  `expire_failed`; check `cron.dead_letter` payloads.
+- Schedule misconfigured (timezone drift) → job runs at the wrong hour.
+- Database connectivity issues from the cron function.
+
+#### Manual retry
+
+```bash
+curl -X GET "https://lumigift.app/api/v1/cron/expire" \
+  -H "Authorization: Bearer $CRON_SECRET"
+```
+
+The job is idempotent — re-running processes only gifts not yet expired. If the
+backlog is large, re-trigger in batches and monitor `durationMs` in `cron.run`.
+
+---
+
+### Payment Reconciliation (`/api/v1/cron/reconcile`)
+
+Reconciles Paystack payment records against gift status and flags mismatches.
+
+#### Verify the job ran
+
+1. Logs: `{service="lumigift"} | json | metric = "cron.run" | job = "reconcile"`
+   — expect one entry every 6 hours.
+2. Healthcheck: confirm a ping within the last 8 hours.
+3. DB state — no payment should remain unreconciled beyond one cycle:
+   ```sql
+   SELECT count(*) FROM payments
+   WHERE status = 'pending' AND created_at < NOW() - INTERVAL '12 hours';
+   ```
+4. Vercel cron dashboard shows successful invocations for the last 24 hours.
+
+#### Common failure reasons
+
+- Paystack API outage or rate limiting → `500`, retry after the window.
+- `PAYSTACK_SECRET_KEY` invalid/rotated → auth errors in logs.
+- Mismatched records flagged for manual review (expected; check the report).
+- Database connectivity issues from the cron function.
+
+#### Manual retry
+
+```bash
+curl -X GET "https://lumigift.app/api/v1/cron/reconcile" \
+  -H "Authorization: Bearer $CRON_SECRET"
+```
+
+Reconciliation is idempotent. After a successful run, review any records still
+flagged as mismatched and resolve them via the admin interface.
+
+---
+
+### Occasion Reminders (`/api/v1/cron/occasion-reminders`)
+
+Sends reminder notifications for upcoming gift occasions.
+
+#### Verify the job ran
+
+1. Logs: `{service="lumigift"} | json | metric = "cron.run" | job = "occasion-reminders"`
+   — expect one entry per day shortly after 08:00 UTC.
+2. Healthcheck: confirm a ping within the last 26 hours.
+3. DB state — no reminder should remain unsent past its send window:
+   ```sql
+   SELECT count(*) FROM occasion_reminders
+   WHERE status = 'pending' AND send_at < NOW() - INTERVAL '2 hours';
+   ```
+4. Vercel cron dashboard shows a successful invocation for today.
+
+#### Common failure reasons
+
+- Notification provider (email/SMS) outage → `500`, reminders left pending.
+- Duplicate-send guard triggered by a partial previous run (expected).
+- Schedule misconfigured (timezone drift).
+- Database connectivity issues from the cron function.
+
+#### Manual retry
+
+```bash
+curl -X GET "https://lumigift.app/api/v1/cron/occasion-reminders" \
+  -H "Authorization: Bearer $CRON_SECRET"
+```
+
+The job is idempotent — already-sent reminders are skipped. Re-trigger after the
+notification provider recovers and verify the DB check returns `0`.
+
+---
+
+### Cron Resolution & Escalation
+
+1. **Cron Function Errors**: fix code, redeploy, re-trigger the missed job.
+2. **Schedule Issues**: update cron expressions in `vercel.json` / Vercel dashboard.
+3. **Timeout Issues**: optimize the job or split it into batches.
+4. **Dead-Letter Recovery**: review the payload, fix the cause, re-trigger.
+
+Escalation:
 
 - If manual intervention needed: Escalate to engineering lead.
 - If cron system down: Contact Vercel support.
 - P0 (`unlock` missed > 5 min, `index-events` missed > 15 min): On-call engineer immediately.
-- P1 (`reconcile` missed > 12 h, `expire` missed > 48 h): Engineering lead.
+- P1 (`reconcile` missed > 12 h, `expire` missed > 48 h, `occasion-reminders` missed > 48 h): Engineering lead.
+
+### On-Call Sign-Off (H-3 Gate)
+
+This runbook must be reviewed and signed off by the on-call team before the H-3
+gate. Record each review below; add a new row for every review cycle.
+
+| Date       | Reviewer (on-call) | Scope reviewed                                   | Sign-off |
+| ---------- | ------------------ | ------------------------------------------------ | -------- |
+| _pending_  | —                  | Cron sections (unlock, expire, reconcile, reminders) | —    |
+
+> **Gate rule:** No production release may proceed past H-3 until the current
+> on-call rotation has signed off on this runbook.
+
+### PagerDuty Link
+
+This runbook is the canonical reference linked from the Lumigift PagerDuty
+service. The PagerDuty service notes and each alert's "Runbook" link point to:
+
+```
+https://github.com/<org>/lumigift/blob/main/docs/ops/runbook.md
+```
+
+When this file moves, update the PagerDuty service Runbook URL and the alert
+action links so on-call engineers land on the correct section.
+
+## Payment Reconciliation Mismatches
+
+### Symptoms
+
+- Sentry alert `PaymentReconciliationMismatch` fires (tag `service: payment-reconciliation`)
+- `level = "error"` logs with `metric = "payment.reconciliation.mismatch"` in the log aggregator
+- A user reports a payment that succeeded at Paystack/Stripe but the gift is still `pending`/`funded` (or vice versa)
+- Rows accumulate in the `reconciliation_errors` table
+
+### How alerting works
+
+The reconciliation job (`payment-reconciliation.service.ts`, run by the
+`/api/v1/cron/reconcile` cron every 6 hours) compares Paystack/Stripe records against the
+database. On every mismatch it:
+
+1. Writes a row to `reconciliation_errors` (provider, provider reference, gift id, expected vs
+   actual status, raw provider payload, `resolved = false`).
+2. Emits a structured `error`-level log entry with the fields
+   `metric=payment.reconciliation.mismatch`, `provider`, `providerReference`, `giftId`,
+   `expectedStatus`, `actualStatus`, `reconciliationErrorId`.
+3. Sends an event to Sentry (tag `service: payment-reconciliation`,
+   `alert: payment-reconciliation-mismatch`).
+
+### Alert routing (PagerDuty / Sentry)
+
+- **Sentry → PagerDuty**: the Sentry alert rule `PaymentReconciliationMismatch` is routed to the
+  PagerDuty service **Lumigift Payments** via the Sentry PagerDuty integration.
+  - Severity **P1** when ≥ 1 mismatch is detected (payments are money-critical).
+  - Auto-resolve in PagerDuty when the Sentry issue is resolved (i.e. after the underlying
+    mismatches are fixed and no new ones are detected in the next reconcile run).
+- **Log-based alert**: Betterstack rule `level = "error"` AND
+  `metric = "payment.reconciliation.mismatch"` > 0 in 5 min → Slack `#incidents`.
+- If PagerDuty is unavailable, Sentry email alerts to the on-call rotation are the fallback.
+
+### Diagnosis
+
+1. List unresolved mismatches via the admin endpoint:
+   ```bash
+   curl -X GET "https://lumigift.app/api/v1/admin/reconciliation-errors?resolved=false&limit=50" \
+     -H "Authorization: Bearer $ADMIN_API_TOKEN"
+   ```
+2. Inspect the rows directly if needed:
+   ```sql
+   SELECT id, provider, provider_reference, gift_id, expected_status, actual_status,
+          created_at
+   FROM reconciliation_errors
+   WHERE resolved = false
+   ORDER BY created_at ASC;
+   ```
+3. Cross-check the provider dashboard (Paystack/Stripe) for the referenced transaction.
+4. Check the `cron.run` logs for the `reconcile` job and the Sentry issue for stack context.
+
+### Resolution
+
+1. Determine the source of truth: the payment provider record wins for payment status.
+2. Correct the DB record (or re-trigger the reconcile cron if the fix is in code):
+   ```sql
+   UPDATE gifts SET status = '<correct_status>' WHERE id = '<gift_id>';
+   ```
+3. Re-run reconciliation to confirm no new mismatch is emitted:
+   ```bash
+   curl -X GET "https://lumigift.app/api/v1/cron/reconcile" \
+     -H "Authorization: Bearer $CRON_SECRET"
+   ```
+4. After investigation, mark the row(s) resolved:
+   ```sql
+   UPDATE reconciliation_errors
+   SET resolved = true, resolved_at = NOW(), resolved_by = '<your-name>',
+       resolution_notes = '<what was done>'
+   WHERE id = '<reconciliation_error_id>';
+   ```
+   (Or use the admin endpoint's resolve action if available.)
+5. Resolve the Sentry issue once the backlog of unresolved rows is empty.
+
+### Escalation Path
+
+- Any mismatch involving real money movement: on-call engineer immediately (P1).
+- > 10 unresolved mismatches or a systematic pattern: escalate to engineering lead and CTO.
+- Suspected double-charge / double-refund: **STOP** manual corrections and escalate to CTO.
 
 ## Application Performance Degradation
+=======
 
 ### Symptoms
 
@@ -665,6 +896,107 @@ stellar contract invoke \
 | Double-transfer risk detected          | **STOP ALL OPERATIONS** — escalate to CTO                      |
 | Reconciliation mismatch > 10 gifts     | Engineering on-call — investigate event indexer                |
 | Stellar network outage                 | Monitor https://status.stellar.org/ — no action until restored |
+
+---
+
+## Blue-Green / Canary Deployment and Rollback
+
+Lumigift releases use a canary-first, blue-green promotion strategy. No change
+goes to 100% of production traffic without passing a canary window and an
+explicit human approval. The workflow lives in `.github/workflows/deploy-canary.yml`.
+
+### Release Flow
+
+1. **Deploy canary (10% of traffic)**
+   - Merging to `main` triggers `deploy-canary.yml`, which deploys the new build
+     as a Vercel preview/canary deployment and routes **10% of production traffic**
+     to it.
+   - The previous (stable) deployment continues to serve the remaining 90%
+     (the "blue" side of blue-green).
+
+2. **Monitoring window (15 minutes)**
+   - The canary is monitored for **15 minutes**.
+   - The gate metric is the **error rate** (5xx responses / total requests),
+     sourced from the `LumigiftHighErrorRate` alert and the Grafana/Loki
+     dashboards (see [Log Aggregation](#log-aggregation)).
+
+3. **Automatic rollback on error-rate breach**
+   - If the canary error rate **exceeds 1%** at any point during the 15-minute
+     window, the workflow **automatically rolls back**: traffic is shifted back
+     to the stable deployment and the canary is discarded. No approval is needed
+     for an automatic rollback.
+
+4. **Promote to production (explicit approval)**
+   - If the canary stays below 1% error rate for the full window, the workflow
+     pauses at the `production` GitHub Environment, which requires **explicit
+     approval** from a designated reviewer.
+   - On approval, the canary is promoted to 100% of traffic (green becomes blue).
+
+### Approving Promotion in GitHub Actions
+
+1. Open the running `deploy-canary.yml` run in the **Actions** tab.
+2. The job `promote-to-production` will show **"Waiting for approval"**.
+3. Click **Review deployments**, select the `production` environment, and click
+   **Approve and deploy**.
+4. Only members of the required reviewers configured on the `production`
+   environment (Settings → Environments → `production`) can approve.
+
+> **Do not approve** if the canary error rate is trending toward 1%, if there are
+> open P0/P1 incidents, or outside the agreed release window.
+
+### Triggering an Automatic Rollback
+
+The automatic rollback is built into `deploy-canary.yml` and fires without
+intervention when the error-rate gate fails. To force the same path manually
+(e.g. you spot a regression the metric missed), re-run the workflow's
+`rollback` job from the Actions UI, or cancel the run before promotion — the
+canary is discarded and traffic returns to the stable deployment.
+
+### Manual Rollback Procedure
+
+Use this when a bad release has already reached 100% of traffic, or when the
+automated path is unavailable.
+
+**Option A — Vercel dashboard (preferred)**
+
+1. Open the project in the Vercel dashboard → **Deployments**.
+2. Locate the last known-good **Production** deployment (the previous blue).
+3. Use the deployment's **⋯ → Promote to Production** action to instantly shift
+   100% of traffic back to it.
+
+**Option B — Vercel CLI**
+
+```bash
+# List recent deployments to find the last known-good one
+vercel ls --token $VERCEL_TOKEN
+
+# Roll production back to the previous deployment
+vercel rollback --token $VERCEL_TOKEN
+
+# Or roll back to a specific deployment URL
+vercel rollback <deployment-url> --token $VERCEL_TOKEN
+```
+
+### Post-Rollback Verification
+
+After rolling back, confirm the system is healthy before closing the incident:
+
+1. **Error rate recovered**: Grafana/Loki error rate back below 1% over 5 minutes
+   (`LumigiftHighErrorRate` alert resolved).
+2. **Traffic on stable build**: Vercel dashboard shows the previous deployment
+   serving 100% of production traffic.
+3. **Smoke checks pass**:
+   ```bash
+   curl -fsS https://lumigift.app/api/health
+   curl -fsS https://lumigift.app/api/v1/gifts
+   ```
+4. **Cron jobs healthy**: no new `cron.dead_letter` entries (see
+   [Cron Job Failure](#cron-job-failure)).
+5. **Data integrity**: confirm no partial writes from the bad release (check
+   recent DB changes and, for escrow, run the reconciliation query in
+   [DB ↔ On-Chain Reconciliation Mismatch](#incident-db--on-chain-reconciliation-mismatch)).
+6. **Communicate**: post a resolution update in Slack `#incidents` and open a
+   blameless post-mortem for any P0/P1.
 
 ---
 

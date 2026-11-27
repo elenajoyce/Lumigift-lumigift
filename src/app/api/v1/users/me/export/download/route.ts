@@ -49,12 +49,12 @@ export const GET = withErrorHandler(async (req: NextRequest) => {
   }
 
   // Consume the export so the single-use link cannot be re-downloaded
-  // indefinitely. The TTL still bounds the window to 24 hours.
+  // indefinitely. The TTL still bounds the window to 1 hour.
   await redis.del(`data-export:${user.id}:${token}`);
 
-  let data: unknown;
+  let job: { status: string; zipBase64?: string };
   try {
-    data = JSON.parse(raw);
+    job = JSON.parse(raw);
   } catch {
     return NextResponse.json<ApiResponse<never>>(
       { success: false, error: "Export payload is corrupt", code: "EXPORT_CORRUPT" },
@@ -62,9 +62,17 @@ export const GET = withErrorHandler(async (req: NextRequest) => {
     );
   }
 
-  const res = NextResponse.json(data);
-  res.headers.set("Content-Disposition", 'attachment; filename="lumigift-data-export.json"');
-  res.headers.set("Content-Type", "application/json");
+  if (!job.zipBase64) {
+    return NextResponse.json<ApiResponse<never>>(
+      { success: false, error: "Export payload is corrupt", code: "EXPORT_CORRUPT" },
+      { status: 500 }
+    );
+  }
+
+  const zipBuf = Buffer.from(job.zipBase64, "base64");
+  const res = new NextResponse(zipBuf);
+  res.headers.set("Content-Disposition", 'attachment; filename="lumigift-data-export.zip"');
+  res.headers.set("Content-Type", "application/zip");
   res.headers.set("Cache-Control", "no-store");
   return res;
 });

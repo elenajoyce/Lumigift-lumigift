@@ -16,6 +16,33 @@ import { randomUUID } from "crypto";
 import pool, { readPool } from "@/lib/db";
 import type { Gift, GiftStatus } from "@/types";
 
+// ─── SQL safety ───────────────────────────────────────────────────────────────
+
+/**
+ * Allowed gift lifecycle values. Every raw SQL statement in this module is
+ * already fully parameterised ($1, $2, ...), but status values originate
+ * from caller-supplied strings (TS types do not exist at runtime). This
+ * whitelist is a defense-in-depth guard so a future caller can never smuggle
+ * anything other than a known status token into a query parameter.
+ */
+const VALID_GIFT_STATUSES: readonly GiftStatus[] = [
+  "draft",
+  "pending_payment",
+  "funded",
+  "locked",
+  "unlocked",
+  "claimed",
+  "expired_pending_refund",
+  "expired",
+  "cancelled",
+];
+
+function assertValidGiftStatus(status: string, label: string): void {
+  if (!VALID_GIFT_STATUSES.includes(status as GiftStatus)) {
+    throw new Error(`[gift.db] Invalid ${label}: ${JSON.stringify(status)}`);
+  }
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface CreateGiftDbInput {
@@ -34,6 +61,10 @@ export interface CreateGiftDbInput {
   provider?: "paystack" | "stripe";
   /** Provider-specific payment reference (e.g. Paystack reference) */
   paymentReference: string;
+  /** Currency actually charged: "ngn" (Paystack) or "usd"/"gbp"/"eur" (Stripe). Issue #527. */
+  paymentCurrency?: string;
+  /** Amount charged in paymentCurrency major units, locked at order creation. Issue #527. */
+  paymentAmount?: number;
 }
 
 export interface GiftDbRow {
@@ -52,6 +83,8 @@ export interface GiftDbRow {
   contract_id: string | null;
   stellar_tx_hash: string | null;
   claim_tx_hash: string | null;
+  payment_currency?: string | null;
+  payment_amount?: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -75,9 +108,28 @@ export function rowToGift(row: GiftDbRow): Gift {
     contractId: row.contract_id ?? undefined,
     stellarTxHash: row.stellar_tx_hash ?? undefined,
     claimTxHash: row.claim_tx_hash ?? undefined,
+    paymentCurrency: row.payment_currency ?? undefined,
+    paymentAmount: row.payment_amount != null ? Number(row.payment_amount) : undefined,
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at),
   };
+}
+
+/**
+ * Records the Stripe currency/amount locked for a gift after the
+ * PaymentIntent is created (the exact minor-unit amount is only known once
+ * the FX conversion runs, which happens after the initial insert). Issue #527.
+ */
+export async function recordPaymentCurrency(
+  giftId: string,
+  currency: string,
+  amount: number
+): Promise<void> {
+  await pool.query("UPDATE gifts SET payment_currency = $1, payment_amount = $2 WHERE id = $3", [
+    currency,
+    amount,
+    giftId,
+  ]);
 }
 
 // ─── Transactional writes ─────────────────────────────────────────────────────
@@ -109,11 +161,11 @@ export async function persistGiftWithPaymentRef(input: CreateGiftDbInput): Promi
       `INSERT INTO gifts (
           id, sender_id, recipient_phone_hash, recipient_name, recipient_email,
           amount_ngn, amount_usdc, message, media_url, unlock_at,
-          theme_id, status, created_at, updated_at
+          theme_id, payment_currency, payment_amount, status, created_at, updated_at
         ) VALUES (
           $1, $2, $3, $4, $5,
           $6, $7, $8, $9, $10,
-          $11, 'pending_payment', NOW(), NOW()
+          $11, $12, $13, 'pending_payment', NOW(), NOW()
         )
         RETURNING *`,
       [
@@ -128,6 +180,8 @@ export async function persistGiftWithPaymentRef(input: CreateGiftDbInput): Promi
         input.mediaUrl ?? null,
         input.unlockAt,
         input.themeId ?? null,
+        input.paymentCurrency ?? "ngn",
+        input.paymentAmount ?? null,
       ]
     );
 
@@ -176,6 +230,9 @@ export async function transitionGiftStatus(
   toStatus: GiftStatus,
   paymentStatus?: "success" | "failed" | "refunded"
 ): Promise<Gift | null> {
+  assertValidGiftStatus(fromStatus, "fromStatus");
+  assertValidGiftStatus(toStatus, "toStatus");
+
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -233,9 +290,50 @@ export async function findGiftById(id: string): Promise<Gift | null> {
  * @returns Array of {@link Gift} domain objects (may be empty).
  */
 export async function findGiftsBySender(senderId: string): Promise<Gift[]> {
+  // Uses idx_gifts_sender_created (migration 0010) for the sender_id filter + created_at ordering.
   const { rows } = await readPool.query<GiftDbRow>(
     `SELECT * FROM gifts WHERE sender_id = $1 ORDER BY created_at DESC`,
     [senderId]
+  );
+  return rows.map(rowToGift);
+}
+
+/**
+ * Looks up all gifts for a given sender filtered by status, newest first.
+ *
+ * Backs the dashboard gift list; benefits from the composite
+ * `(sender_id, status)` index added in migration 0010.
+ *
+ * @param senderId - User ID of the sender.
+ * @param status - Gift status to filter on.
+ * @returns Array of {@link Gift} domain objects (may be empty).
+ */
+export async function findGiftsBySenderAndStatus(
+  senderId: string,
+  status: GiftStatus
+): Promise<Gift[]> {
+  // Uses idx_gifts_sender_status_created (migration 0010) — composite (sender_id, status).
+  const { rows } = await readPool.query<GiftDbRow>(
+    `SELECT * FROM gifts WHERE sender_id = $1 AND status = $2 ORDER BY created_at DESC`,
+    [senderId, status]
+  );
+  return rows.map(rowToGift);
+}
+
+/**
+ * Looks up all locked gifts whose unlock time has passed, oldest unlock first.
+ *
+ * Used by the unlock scheduler; benefits from the composite
+ * `(unlock_at, status)` index added in migration 0010.
+ *
+ * @param now - Reference timestamp (defaults to the current time).
+ * @returns Array of {@link Gift} domain objects (may be empty).
+ */
+export async function findGiftsDueForUnlock(now: Date = new Date()): Promise<Gift[]> {
+  // Uses idx_gifts_unlock_at_status (migration 0010) — composite (unlock_at, status).
+  const { rows } = await readPool.query<GiftDbRow>(
+    `SELECT * FROM gifts WHERE unlock_at <= $1 AND status = 'locked' ORDER BY unlock_at ASC`,
+    [now]
   );
   return rows.map(rowToGift);
 }
@@ -252,4 +350,197 @@ export async function findGiftsByRecipientHash(recipientPhoneHash: string): Prom
     [recipientPhoneHash]
   );
   return rows.map(rowToGift);
+}
+
+/**
+ * Looks up a gift row by its on-chain contract ID.
+ *
+ * @param contractId - Soroban contract ID associated with the gift.
+ * @returns The {@link Gift} domain object, or `null` if not found.
+ */
+export async function findGiftByContractId(contractId: string): Promise<Gift | null> {
+  const { rows } = await readPool.query<GiftDbRow>(
+    `SELECT * FROM gifts WHERE contract_id = $1 LIMIT 1`,
+    [contractId]
+  );
+  return rows[0] ? rowToGift(rows[0]) : null;
+}
+
+/**
+ * Sums the NGN amount of all gifts created by a sender since a given date.
+ *
+ * Used to enforce daily creation limits without relying on in-memory state.
+ *
+ * @param senderId - User ID of the sender.
+ * @param since - Lower bound (inclusive) on `created_at`.
+ * @returns Total amount in NGN (0 when no rows match).
+ */
+export async function sumGiftAmountNgnBySenderSince(senderId: string, since: Date): Promise<number> {
+  const { rows } = await readPool.query<{ total: string | null }>(
+    `SELECT COALESCE(SUM(amount_ngn), 0) AS total
+       FROM gifts
+      WHERE sender_id = $1
+        AND created_at >= $2`,
+    [senderId, since]
+  );
+  return Number(rows[0]?.total ?? 0);
+}
+
+/**
+ * Records the claim transaction hash for a gift.
+ *
+ * @param id - Gift UUID.
+ * @param claimTxHash - Stellar transaction hash of the claim.
+ * @returns The updated {@link Gift}, or `null` if the gift does not exist.
+ */
+export async function updateGiftClaimTxHash(id: string, claimTxHash: string): Promise<Gift | null> {
+  const { rows } = await pool.query<GiftDbRow>(
+    `UPDATE gifts
+        SET claim_tx_hash = $1, updated_at = NOW()
+      WHERE id = $2
+      RETURNING *`,
+    [claimTxHash, id]
+  );
+  return rows[0] ? rowToGift(rows[0]) : null;
+}
+
+/**
+ * Soft-deletes a gift by stamping `deleted_at`.
+ *
+ * @param id - Gift UUID.
+ * @returns `true` if a row was updated, `false` if the gift was not found.
+ */
+export async function softDeleteGift(id: string): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    `UPDATE gifts
+        SET deleted_at = NOW(), updated_at = NOW()
+      WHERE id = $1
+        AND deleted_at IS NULL`,
+    [id]
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+/**
+ * Hard-deletes gifts that were soft-deleted before the given cutoff.
+ *
+ * @param olderThan - Only rows with `deleted_at < olderThan` are removed.
+ * @returns Number of rows deleted.
+ */
+export async function purgeSoftDeletedGifts(olderThan: Date): Promise<number> {
+  const { rowCount } = await pool.query(
+    `DELETE FROM gifts
+      WHERE deleted_at IS NOT NULL
+        AND deleted_at < $1`,
+    [olderThan]
+  );
+  return rowCount ?? 0;
+}
+
+export interface FindGiftsBySenderOptions {
+  /** Maximum number of rows to return (defaults to 20). */
+  limit?: number;
+  /** Filter by gift status. */
+  status?: GiftStatus;
+}
+
+export interface GiftPage {
+  gifts: Gift[];
+  /** Cursor to pass as `cursor` for the next page, or `null` when exhausted. */
+  nextCursor: string | null;
+}
+
+/**
+ * Cursor-paginated lookup of a sender's gifts, newest first.
+ *
+ * The cursor is the `created_at` timestamp of the last row of the previous
+ * page (ISO string). Rows sharing the same timestamp are disambiguated by id.
+ *
+ * @param senderId - User ID of the sender.
+ * @param options - Pagination and filter options.
+ * @param cursor - Opaque cursor from a previous {@link GiftPage}.
+ * @returns A page of gifts plus the cursor for the next page.
+ */
+export async function findGiftsBySenderCursor(
+  senderId: string,
+  options: FindGiftsBySenderOptions = {},
+  cursor?: string | null
+): Promise<GiftPage> {
+  const limit = options.limit ?? 20;
+  const params: unknown[] = [senderId];
+  const conditions: string[] = ["sender_id = $1", "deleted_at IS NULL"];
+
+  if (options.status) {
+    params.push(options.status);
+    conditions.push(`status = $${params.length}`);
+  }
+
+  if (cursor) {
+    const cursorDate = new Date(cursor);
+    params.push(cursorDate);
+    conditions.push(`created_at < $${params.length}`);
+  }
+
+  params.push(limit + 1);
+
+  const { rows } = await readPool.query<GiftDbRow>(
+    `SELECT * FROM gifts
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY created_at DESC, id DESC
+      LIMIT $${params.length}`,
+    params
+  );
+
+  const hasMore = rows.length > limit;
+  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  const last = pageRows[pageRows.length - 1];
+
+  return {
+    gifts: pageRows.map(rowToGift),
+    nextCursor: hasMore && last ? new Date(last.created_at).toISOString() : null,
+  };
+}
+
+/**
+ * Offset-paginated lookup of a sender's gifts, newest first.
+ *
+ * @param senderId - User ID of the sender.
+ * @param options - Pagination and filter options.
+ * @param offset - Number of rows to skip (defaults to 0).
+ * @returns A page of gifts plus the total row count for the filter.
+ */
+export async function findGiftsBySenderOffset(
+  senderId: string,
+  options: FindGiftsBySenderOptions = {},
+  offset = 0
+): Promise<{ gifts: Gift[]; total: number }> {
+  const limit = options.limit ?? 20;
+  const params: unknown[] = [senderId];
+  const conditions: string[] = ["sender_id = $1", "deleted_at IS NULL"];
+
+  if (options.status) {
+    params.push(options.status);
+    conditions.push(`status = $${params.length}`);
+  }
+
+  const where = conditions.join(" AND ");
+
+  const countResult = await readPool.query<{ count: string }>(
+    `SELECT COUNT(*) AS count FROM gifts WHERE ${where}`,
+    params
+  );
+
+  const pageParams = [...params, limit, offset];
+  const { rows } = await readPool.query<GiftDbRow>(
+    `SELECT * FROM gifts
+      WHERE ${where}
+      ORDER BY created_at DESC, id DESC
+      LIMIT $${pageParams.length - 1} OFFSET $${pageParams.length}`,
+    pageParams
+  );
+
+  return {
+    gifts: rows.map(rowToGift),
+    total: Number(countResult.rows[0]?.count ?? 0),
+  };
 }

@@ -21,6 +21,8 @@ import {
   nativeToScVal,
   scValToNative,
 } from "@stellar/stellar-sdk";
+import { readFileSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 
 // ─── Error codes (mirrors EscrowError in lib.rs) ──────────────────────────────
 
@@ -35,6 +37,8 @@ export enum EscrowError {
   InvalidUnlockTime = 8,
   /** The supplied token address is not an allowed USDC contract for this network. */
   InvalidToken = 9,
+  /** The sender does not hold enough of the token to fund the escrow. */
+  InsufficientBalance = 10,
 }
 
 export class EscrowContractError extends Error {
@@ -69,6 +73,19 @@ export interface EscrowState {
   amount: bigint; // stroops (7 decimal places)
   unlockTime: bigint; // Unix timestamp (seconds)
   claimed: boolean;
+}
+
+/**
+ * Decoded payload of the `Upgraded` event emitted by the contract's
+ * admin-authorized `upgrade` function.
+ */
+export interface UpgradedEvent {
+  /** Stellar public key (G…) of the admin that authorized the upgrade. */
+  admin: string;
+  /** Hex-encoded hash of the new contract WASM. */
+  newWasmHash: string;
+  /** Ledger timestamp (Unix seconds) at which the upgrade was applied. */
+  upgradedAt: bigint;
 }
 
 // ─── Client options ───────────────────────────────────────────────────────────
@@ -107,15 +124,24 @@ export class EscrowClient {
    * @param token       - USDC contract address (C…)
    * @param amount      - Amount in stroops (i128)
    * @param unlockTime  - Unix timestamp (u64) after which the gift can be claimed
+   * @param gracePeriodSecs - Optional grace window (u64) after `unlockTime` during
+   *                          which claims are still allowed. Omitted ⇒ contract
+   *                          default of 0 (claims only at/after `unlockTime`).
    */
   async buildInitialize(
     sender: string,
     recipient: string,
     token: string,
     amount: bigint,
-    unlockTime: bigint
+    unlockTime: bigint,
+    gracePeriodSecs?: bigint
   ): Promise<string> {
     const account = await this.rpc.getAccount(this.opts.sourcePublicKey);
+
+    const gracePeriodScVal =
+      gracePeriodSecs === undefined
+        ? xdr.ScVal.scvVoid()
+        : nativeToScVal(gracePeriodSecs, { type: "u64" });
 
     const tx = new TransactionBuilder(account, {
       fee: BASE_FEE,
@@ -128,9 +154,108 @@ export class EscrowClient {
           new Address(recipient).toScVal(),
           new Address(token).toScVal(),
           nativeToScVal(amount, { type: "i128" }),
-          nativeToScVal(unlockTime, { type: "u64" })
+          nativeToScVal(unlockTime, { type: "u64" }),
+          gracePeriodScVal
         )
       )
+      .setTimeout(30)
+      .build();
+
+    const simResult = await this.rpc.simulateTransaction(tx);
+    if (SorobanRpc.Api.isSimulationError(simResult)) {
+      throw parseContractError(simResult.error);
+    }
+
+    return SorobanRpc.assembleTransaction(tx, simResult).build().toXDR();
+  }
+
+  // ── batch_initialize ────────────────────────────────────────────────────────
+
+  /**
+   * Builds a single `batch_initialize` transaction envelope that atomically
+   * initializes up to {@link MAX_BATCH_SIZE} escrow instances.
+   *
+   * The batch size is validated client-side before any RPC call is made; the
+   * contract enforces the same limit on-chain (`BatchTooLarge` / `EmptyBatch`).
+   *
+   * @param gifts - Gift parameters to initialize (1–20 items)
+   */
+  async batchInitialize(gifts: GiftParams[]): Promise<string> {
+    if (gifts.length === 0) {
+      throw new EscrowContractError(EscrowError.EmptyBatch);
+    }
+    if (gifts.length > MAX_BATCH_SIZE) {
+      throw new EscrowContractError(EscrowError.BatchTooLarge);
+    }
+
+    const account = await this.rpc.getAccount(this.opts.sourcePublicKey);
+
+    const giftsScVal = xdr.ScVal.scvVec(
+      gifts.map((gift) =>
+        xdr.ScVal.scvMap([
+          new xdr.ScMapEntry({
+            key: nativeToScVal("sender", { type: "symbol" }),
+            val: new Address(gift.sender).toScVal(),
+          }),
+          new xdr.ScMapEntry({
+            key: nativeToScVal("recipient", { type: "symbol" }),
+            val: new Address(gift.recipient).toScVal(),
+          }),
+          new xdr.ScMapEntry({
+            key: nativeToScVal("token", { type: "symbol" }),
+            val: new Address(gift.token).toScVal(),
+          }),
+          new xdr.ScMapEntry({
+            key: nativeToScVal("amount", { type: "symbol" }),
+            val: nativeToScVal(gift.amount, { type: "i128" }),
+          }),
+          new xdr.ScMapEntry({
+            key: nativeToScVal("unlock_time", { type: "symbol" }),
+            val: nativeToScVal(gift.unlockTime, { type: "u64" }),
+          }),
+        ])
+      )
+    );
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.opts.networkPassphrase,
+    })
+      .addOperation(this.contract.call("batch_initialize", giftsScVal))
+      .setTimeout(30)
+      .build();
+
+    const simResult = await this.rpc.simulateTransaction(tx);
+    if (SorobanRpc.Api.isSimulationError(simResult)) {
+      throw parseContractError(simResult.error);
+    }
+
+    return SorobanRpc.assembleTransaction(tx, simResult).build().toXDR();
+  }
+
+  // ── cancel ───────────────────────────────────────────────────────────────────
+
+  /**
+   * Builds a `cancel` transaction envelope ready to be signed and submitted.
+   *
+   * @param reason - On-chain cancellation reason code (see {@link CancelReason})
+   */
+  async buildCancel(reason: CancelReason): Promise<string> {
+    if (
+      reason !== CancelReason.SenderRequested &&
+      reason !== CancelReason.Expired &&
+      reason !== CancelReason.Admin
+    ) {
+      throw new EscrowContractError(EscrowError.InvalidCancelReason);
+    }
+
+    const account = await this.rpc.getAccount(this.opts.sourcePublicKey);
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.opts.networkPassphrase,
+    })
+      .addOperation(this.contract.call("cancel", nativeToScVal(reason, { type: "u32" })))
       .setTimeout(30)
       .build();
 
@@ -164,6 +289,37 @@ export class EscrowClient {
     }
 
     return SorobanRpc.assembleTransaction(tx, simResult).build().toXDR();
+  }
+
+  // ── get_network ──────────────────────────────────────────────────────────────
+
+  /**
+   * Simulates `get_network` and returns the network the contract was deployed
+   * against. Read-only — no transaction is submitted.
+   */
+  async getNetwork(): Promise<Network> {
+    const account = await this.rpc.getAccount(this.opts.sourcePublicKey);
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.opts.networkPassphrase,
+    })
+      .addOperation(this.contract.call("get_network"))
+      .setTimeout(30)
+      .build();
+
+    const simResult = await this.rpc.simulateTransaction(tx);
+    if (SorobanRpc.Api.isSimulationError(simResult)) {
+      throw parseContractError(simResult.error);
+    }
+
+    const returnVal = (simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse).result
+      ?.retval;
+    if (!returnVal) {
+      throw new Error("get_network simulation returned no value");
+    }
+
+    return decodeGetNetworkResult(returnVal);
   }
 
   // ── get_state ────────────────────────────────────────────────────────────────
@@ -237,6 +393,48 @@ export class EscrowClient {
     return decodeGetStatusResult(returnVal);
   }
 
+  // ── upgrade ──────────────────────────────────────────────────────────────────
+
+  /**
+   * Builds an `upgrade` transaction envelope ready to be signed by the admin
+   * and submitted.
+   *
+   * The contract requires the admin's authorization; the returned XDR must be
+   * signed by the admin key (held in the secrets manager for mainnet) before
+   * submission. On success the contract emits an `Upgraded` event which can be
+   * decoded with {@link decodeUpgradedEvent}.
+   *
+   * @param newWasmHash - 32-byte hash of the new contract WASM (hex or Buffer)
+   */
+  async buildUpgrade(newWasmHash: string | Buffer): Promise<string> {
+    const wasmHashBytes =
+      typeof newWasmHash === "string" ? Buffer.from(newWasmHash, "hex") : newWasmHash;
+    if (wasmHashBytes.length !== 32) {
+      throw new Error(
+        `Invalid WASM hash length: expected 32 bytes, got ${wasmHashBytes.length}`
+      );
+    }
+
+    const account = await this.rpc.getAccount(this.opts.sourcePublicKey);
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.opts.networkPassphrase,
+    })
+      .addOperation(
+        this.contract.call("upgrade", nativeToScVal(wasmHashBytes, { type: "bytes" }))
+      )
+      .setTimeout(30)
+      .build();
+
+    const simResult = await this.rpc.simulateTransaction(tx);
+    if (SorobanRpc.Api.isSimulationError(simResult)) {
+      throw parseContractError(simResult.error);
+    }
+
+    return SorobanRpc.assembleTransaction(tx, simResult).build().toXDR();
+  }
+
   // ── submitTransaction ────────────────────────────────────────────────────────
 
   /**
@@ -291,6 +489,17 @@ function decodeGetStateResult(val: xdr.ScVal): EscrowState {
   };
 }
 
+function decodeGetNetworkResult(val: xdr.ScVal): Network {
+  // get_network returns a Network enum — Soroban encodes it as a u32 ScVal.
+  const native = scValToNative(val) as number;
+  switch (native) {
+    case 0: return Network.Mainnet;
+    case 1: return Network.Testnet;
+    default:
+      throw new Error(`Unknown Network value: ${native}`);
+  }
+}
+
 function decodeGetStatusResult(val: xdr.ScVal): EscrowStatus {
   // get_status returns an EscrowStatus enum — Soroban encodes it as a u32 ScVal.
   const native = scValToNative(val) as number;
@@ -302,6 +511,33 @@ function decodeGetStatusResult(val: xdr.ScVal): EscrowStatus {
     default:
       throw new Error(`Unknown EscrowStatus value: ${native}`);
   }
+}
+
+/**
+ * Decodes an `Upgraded` contract event emitted by the escrow contract.
+ *
+ * The event topics are `["upgraded", admin]` and the data payload is the tuple
+ * `(new_wasm_hash: BytesN<32>, upgraded_at: u64)`.
+ */
+export function decodeUpgradedEvent(event: SorobanRpc.Api.EventResponse): UpgradedEvent {
+  const topics = event.topic ?? [];
+  if (topics.length < 2) {
+    throw new Error("Upgraded event is missing the admin topic");
+  }
+  const admin = Address.fromScVal(topics[1]).toString();
+
+  const data = event.value.vec();
+  if (!data || data.length !== 2) {
+    throw new Error(`Unexpected Upgraded event data shape: ${JSON.stringify(event.value)}`);
+  }
+  const [wasmHashVal, upgradedAtVal] = data;
+  const wasmHashBytes = scValToNative(wasmHashVal) as Buffer | Uint8Array;
+
+  return {
+    admin,
+    newWasmHash: Buffer.from(wasmHashBytes).toString("hex"),
+    upgradedAt: BigInt(scValToNative(upgradedAtVal) as number | bigint),
+  };
 }
 
 function parseContractError(errorMsg: string): EscrowContractError | Error {
@@ -321,22 +557,60 @@ function sleep(ms: number): Promise<void> {
 // ─── Factory ──────────────────────────────────────────────────────────────────
 
 /**
+ * Reads the deployed contract ID for a network from the committed
+ * `.contract-ids.json` manifest at the repository root.
+ *
+ * The manifest is written by `scripts/deploy-contract.ts` and has the shape:
+ *
+ *   { "testnet": "C…", "mainnet": "C…" }
+ */
+export function readContractIdFromManifest(
+  network: "mainnet" | "testnet",
+  manifestPath: string = resolvePath(process.cwd(), ".contract-ids.json")
+): string | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(manifestPath, "utf8");
+  } catch {
+    return undefined;
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    throw new Error(`Malformed contract ID manifest at ${manifestPath}`);
+  }
+
+  const id = parsed[network];
+  return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
+/**
  * Creates an {@link EscrowClient} from environment variables.
  * Requires: STELLAR_RPC_URL, STELLAR_NETWORK_PASSPHRASE,
  *           STELLAR_ESCROW_CONTRACT_ID, STELLAR_SERVER_PUBLIC_KEY
+ *
+ * When `STELLAR_ESCROW_CONTRACT_ID` is unset and `STELLAR_NETWORK=mainnet`,
+ * the contract ID is read from the committed `.contract-ids.json` manifest.
  */
 export function createEscrowClient(): EscrowClient {
+  const network = process.env.STELLAR_NETWORK === "mainnet" ? "mainnet" : "testnet";
+
   const rpcUrl =
     process.env.STELLAR_RPC_URL ??
-    (process.env.STELLAR_NETWORK === "mainnet"
+    (network === "mainnet"
       ? "https://soroban-rpc.stellar.org"
       : "https://soroban-testnet.stellar.org");
 
   const networkPassphrase =
     process.env.STELLAR_NETWORK_PASSPHRASE ??
-    (process.env.STELLAR_NETWORK === "mainnet" ? Networks.PUBLIC : Networks.TESTNET);
+    (network === "mainnet" ? Networks.PUBLIC : Networks.TESTNET);
 
-  const contractId = process.env.STELLAR_ESCROW_CONTRACT_ID;
+  let contractId = process.env.STELLAR_ESCROW_CONTRACT_ID;
+  if (!contractId && network === "mainnet") {
+    contractId = readContractIdFromManifest("mainnet");
+  }
   if (!contractId) throw new Error("Missing STELLAR_ESCROW_CONTRACT_ID");
 
   const sourcePublicKey = process.env.STELLAR_SERVER_PUBLIC_KEY;

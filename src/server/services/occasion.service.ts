@@ -10,9 +10,10 @@
 
 import pool from "@/lib/db";
 import { sendOccasionReminder } from "@/lib/sms";
+import { sendOccasionReminderEmail } from "@/lib/email";
 
-/** Days before the occasion that the reminder is sent. */
-export const REMINDER_LEAD_DAYS = 7;
+/** Days-before-occasion windows a reminder is sent for (issue #519). */
+export const REMINDER_LEAD_DAYS_WINDOWS = [7, 1] as const;
 
 export interface Occasion {
   id: string;
@@ -102,34 +103,57 @@ export async function deleteOccasion(userId: string, occasionId: string): Promis
  * @returns Number of reminders sent.
  */
 export async function processOccasionReminders(now: Date = new Date()): Promise<number> {
-  const target = new Date(now);
-  target.setUTCDate(target.getUTCDate() + REMINDER_LEAD_DAYS);
-
-  const { rows } = await pool.query<{
-    id: string;
-    contact_name: string;
-    label: string;
-    phone: string;
-  }>(
-    "SELECT o.id, o.contact_name, o.label, u.phone " +
-      "FROM occasions o " +
-      "JOIN users u ON u.id = o.user_id " +
-      "WHERE o.reminders_enabled " +
-      "AND EXTRACT(MONTH FROM o.occasion_date) = $1 " +
-      "AND EXTRACT(DAY FROM o.occasion_date) = $2 " +
-      "AND (o.last_reminded_at IS NULL OR o.last_reminded_at < NOW() - INTERVAL '1 day')",
-    [target.getUTCMonth() + 1, target.getUTCDate()]
-  );
-
   let sent = 0;
-  for (const row of rows) {
-    try {
-      await sendOccasionReminder(row.phone, row.contact_name, row.label, row.id);
-      await pool.query("UPDATE occasions SET last_reminded_at = NOW() WHERE id = $1", [row.id]);
-      sent++;
-    } catch (err) {
-      console.error("[occasions] reminder failed", { occasionId: row.id, error: err });
+
+  // Two independent windows: 7 days out and 1 day out. An occasion can fire
+  // in both windows (on different days), but `last_reminded_at` combined with
+  // the 1-day guard below prevents it firing twice for the *same* window if
+  // the cron runs more than once in a day.
+  for (const daysUntil of REMINDER_LEAD_DAYS_WINDOWS) {
+    const target = new Date(now);
+    target.setUTCDate(target.getUTCDate() + daysUntil);
+
+    const { rows } = await pool.query<{
+      id: string;
+      contact_name: string;
+      label: string;
+      phone: string;
+      email: string | null;
+    }>(
+      "SELECT o.id, o.contact_name, o.label, u.phone, u.email " +
+        "FROM occasions o " +
+        "JOIN users u ON u.id = o.user_id " +
+        "WHERE o.reminders_enabled " +
+        "AND EXTRACT(MONTH FROM o.occasion_date) = $1 " +
+        "AND EXTRACT(DAY FROM o.occasion_date) = $2 " +
+        "AND (o.last_reminded_at IS NULL OR o.last_reminded_at < NOW() - INTERVAL '20 hours')",
+      [target.getUTCMonth() + 1, target.getUTCDate()]
+    );
+
+    for (const row of rows) {
+      try {
+        await sendOccasionReminder(row.phone, row.contact_name, row.label, row.id, daysUntil);
+        if (row.email) {
+          await sendOccasionReminderEmail(row.email, {
+            contactName: row.contact_name,
+            label: row.label,
+            occasionId: row.id,
+            daysUntil,
+          }).catch((err: unknown) =>
+            console.error("[occasions] reminder email failed", { occasionId: row.id, error: err })
+          );
+        }
+        await pool.query("UPDATE occasions SET last_reminded_at = NOW() WHERE id = $1", [row.id]);
+        sent++;
+      } catch (err) {
+        console.error("[occasions] reminder failed", {
+          occasionId: row.id,
+          daysUntil,
+          error: err,
+        });
+      }
     }
   }
+
   return sent;
 }

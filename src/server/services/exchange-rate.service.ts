@@ -1,5 +1,6 @@
 import { getRedisClient } from "@/lib/redis";
 import { serverConfig } from "@/server/config";
+import { incrementFunnelCounter } from "@/lib/metrics";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -25,6 +26,112 @@ const FETCH_TIMEOUT_MS = 5_000;
 const MAX_RETRIES = 2;
 /** Base delay for exponential backoff. */
 const RETRY_BASE_DELAY_MS = 200;
+
+// ─── Circuit breaker (Horizon) ────────────────────────────────────────────────
+
+/** Consecutive failures within the window before the circuit opens. */
+const CIRCUIT_FAILURE_THRESHOLD = 5;
+/** Window within which failures must occur to count toward the threshold. */
+const CIRCUIT_FAILURE_WINDOW_MS = 60_000; // 60 s
+/** Cool-down before the circuit moves from OPEN to HALF_OPEN (retry probe). */
+const CIRCUIT_COOLDOWN_MS = 30_000; // 30 s
+/** How long the circuit may stay OPEN before an operational alert fires. */
+const CIRCUIT_ALERT_AFTER_MS = 5 * 60_000; // 5 minutes
+
+type CircuitState = "closed" | "open" | "half_open";
+
+interface CircuitBreakerState {
+  state: CircuitState;
+  failureTimestamps: number[];
+  openedAt: number | null;
+  alertFired: boolean;
+}
+
+const horizonCircuit: CircuitBreakerState = {
+  state: "closed",
+  failureTimestamps: [],
+  openedAt: null,
+  alertFired: false,
+};
+
+/** Exposed for metrics/tests: current circuit breaker state. */
+export function getCircuitState(): CircuitState {
+  maybeTransitionToHalfOpen();
+  return horizonCircuit.state;
+}
+
+function maybeTransitionToHalfOpen(): void {
+  if (
+    horizonCircuit.state === "open" &&
+    horizonCircuit.openedAt !== null &&
+    Date.now() - horizonCircuit.openedAt >= CIRCUIT_COOLDOWN_MS
+  ) {
+    horizonCircuit.state = "half_open";
+    console.warn("[exchange-rate] circuit breaker half-open — probing Horizon");
+  }
+}
+
+function recordCircuitFailure(): void {
+  const now = Date.now();
+  horizonCircuit.failureTimestamps = horizonCircuit.failureTimestamps.filter(
+    (ts) => now - ts <= CIRCUIT_FAILURE_WINDOW_MS
+  );
+  horizonCircuit.failureTimestamps.push(now);
+
+  if (
+    horizonCircuit.state !== "open" &&
+    horizonCircuit.failureTimestamps.length >= CIRCUIT_FAILURE_THRESHOLD
+  ) {
+    horizonCircuit.state = "open";
+    horizonCircuit.openedAt = now;
+    horizonCircuit.alertFired = false;
+    incrementCircuitMetric("open");
+    console.error("[exchange-rate] circuit breaker OPEN — Horizon failing repeatedly", {
+      failures: horizonCircuit.failureTimestamps.length,
+    });
+  } else if (horizonCircuit.state === "half_open") {
+    // Probe failed — re-open and reset the cool-down timer.
+    horizonCircuit.state = "open";
+    horizonCircuit.openedAt = now;
+    incrementCircuitMetric("open");
+  }
+
+  maybeAlertIfStuckOpen();
+}
+
+function recordCircuitSuccess(): void {
+  if (horizonCircuit.state !== "closed") {
+    incrementCircuitMetric("close");
+  }
+  horizonCircuit.state = "closed";
+  horizonCircuit.failureTimestamps = [];
+  horizonCircuit.openedAt = null;
+  horizonCircuit.alertFired = false;
+}
+
+function maybeAlertIfStuckOpen(): void {
+  if (
+    horizonCircuit.state === "open" &&
+    horizonCircuit.openedAt !== null &&
+    !horizonCircuit.alertFired &&
+    Date.now() - horizonCircuit.openedAt >= CIRCUIT_ALERT_AFTER_MS
+  ) {
+    horizonCircuit.alertFired = true;
+    console.error(
+      "[exchange-rate] ALERT: Horizon circuit breaker has been OPEN for over 5 minutes",
+      { openedAt: new Date(horizonCircuit.openedAt).toISOString() }
+    );
+  }
+}
+
+/** Best-effort metric counter increment; swallows errors so the breaker never throws. */
+function incrementCircuitMetric(event: "open" | "close"): void {
+  try {
+    incrementFunnelCounter?.(`exchange_rate_circuit_${event}`);
+  } catch {
+    // never let a metrics hiccup block the breaker
+  }
+}
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
@@ -215,14 +322,28 @@ export async function getExchangeRate(): Promise<ExchangeRateResult> {
 
   console.log("[exchange-rate] cache miss — fetching fresh rate");
 
-  // ── 2. Primary provider: Horizon ─────────────────────────────────────────
-  try {
-    const rate = await fetchWithRetry(fetchFromHorizon);
-    await cacheRate(redis, rate);
-    console.log("[exchange-rate] fetched from Horizon", { rate });
-    return { ngnPerUsdc: rate, stale: false, source: "horizon" };
-  } catch (horizonErr) {
-    console.error("[exchange-rate] Horizon failed (all retries exhausted)", horizonErr);
+  // ── 2. Primary provider: Horizon (guarded by circuit breaker) ────────────
+  maybeTransitionToHalfOpen();
+  if (horizonCircuit.state === "open") {
+    console.warn("[exchange-rate] circuit OPEN — skipping Horizon, serving stale rate");
+    maybeAlertIfStuckOpen();
+    const staleRate = await getValidStaleRate(redis);
+    if (staleRate !== null) {
+      return { ngnPerUsdc: staleRate, stale: true, source: "cache" };
+    }
+    // No stale rate available even with the circuit open — fall through to
+    // the fallback provider and hardcoded fallback below.
+  } else {
+    try {
+      const rate = await fetchWithRetry(fetchFromHorizon);
+      recordCircuitSuccess();
+      await cacheRate(redis, rate);
+      console.log("[exchange-rate] fetched from Horizon", { rate });
+      return { ngnPerUsdc: rate, stale: false, source: "horizon" };
+    } catch (horizonErr) {
+      recordCircuitFailure();
+      console.error("[exchange-rate] Horizon failed (all retries exhausted)", horizonErr);
+    }
   }
 
   // ── 3. Fallback provider: Coingecko ───────────────────────────────────────

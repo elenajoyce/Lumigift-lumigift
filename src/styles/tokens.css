@@ -91,17 +91,53 @@
   /* Used as a safe fallback when reduced-motion is preferred */
   --transition-instant: 0.01ms;
 
+  /* Animation durations */
+  --duration-fast: 150ms;
+  --duration-base: 300ms;
+  --duration-slow: 500ms;
+
+  /* Pulse animation for skeleton loaders */
+  @keyframes pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.5;
+    }
+  }
+
   /* Layout */
   --max-width-sm: 640px;
   --max-width-md: 768px;
   --max-width-lg: 1024px;
   --max-width-xl: 1280px;
   --max-width-content: 720px;
+
+  /* Z-index layering — single source of truth for stacking order (#496).
+     Higher values paint on top. Keep every overlay component referencing
+     these tokens instead of hard-coded integers.
+       1. --z-base      : default page content
+       2. --z-navbar    : sticky navbar / header
+       3. --z-dropdown  : navbar dropdown menus and popovers
+       4. --z-overlay   : modal/backdrop overlays
+       5. --z-toast     : toasts must sit above every overlay/dropdown layer */
+  --z-base: 0;
+  --z-navbar: 50;
+  --z-dropdown: 60;
+  --z-overlay: 100;
+  --z-toast: 1000;
 }
 
 /* ── Light theme ──────────────────────────────────────────────────────────── */
 [data-theme="light"] {
   --color-scheme: light;
+
+  /* Brand — darkened for ≥ 4.5:1 contrast on light backgrounds (#474) */
+  --color-brand-primary: #5a2ee0;
+  --color-brand-primary-hover: #4a24bd;
+  --color-brand-secondary: #d64545;
+  --color-brand-accent: #b8860b;
 
   --color-bg: #f5f5fa;
   --color-bg-surface: #ffffff;
@@ -132,6 +168,12 @@
   :root:not([data-theme="dark"]) {
     --color-scheme: light;
 
+    /* Brand — darkened for ≥ 4.5:1 contrast on light backgrounds (#474) */
+    --color-brand-primary: #5a2ee0;
+    --color-brand-primary-hover: #4a24bd;
+    --color-brand-secondary: #d64545;
+    --color-brand-accent: #b8860b;
+
     --color-bg: #f5f5fa;
     --color-bg-surface: #ffffff;
     --color-bg-elevated: #eeeef5;
@@ -143,12 +185,6 @@
     --color-text-secondary: #4a4a62;
     --color-text-muted: #62627a;
     --color-text-inverse: #f0f0f5;
-
-    /* Darker status colours keep ≥ 4.5:1 on light backgrounds (#371) */
-    --color-success: #166534;
-    --color-warning: #92400e;
-    --color-error: #b91c1c;
-    --color-info: #1d4ed8;
 
     /* Darker status colours keep ≥ 4.5:1 on light backgrounds (#371) */
     --color-success: #166534;

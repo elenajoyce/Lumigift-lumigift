@@ -85,6 +85,7 @@ export function ClaimButton({
   const themeClass = themeStyle ? `${styles.wrapper} gift-theme` : styles.wrapper;
   const [claimError, setClaimError] = useState<{ message: string; canRetry: boolean } | null>(null);
   const [txHash, setTxHash] = useState<string | null>(null);
+  const [claimed, setClaimed] = useState(false);
   const { csrfFetch } = useCsrf();
   const queryClient = useQueryClient();
 
@@ -103,11 +104,14 @@ export function ClaimButton({
     onMutate: () => {
       setClaimError(null);
       setTxHash(null);
+      setClaimed(false);
       onStatusChange("claiming" as GiftStatus);
     },
     onSuccess: (data) => {
       if (data?.txHash) {
         setTxHash(data.txHash);
+      } else {
+        setClaimed(true);
       }
       onStatusChange("claimed");
       // Invalidate gift list so the dashboard reflects the claimed status
@@ -157,11 +161,11 @@ export function ClaimButton({
       <button
         className="btn btn--primary"
         onClick={() => mutate()}
-        disabled={isPending || (claimError !== null && !claimError.canRetry)}
+        disabled={isPending || claimed || (claimError !== null && !claimError.canRetry)}
         aria-busy={isPending}
       >
         {isPending ? <span className={styles.spinner} aria-hidden="true" /> : null}
-        {isPending ? "Claiming…" : "Claim Gift"}
+        {isPending ? "Claiming…" : claimed ? "Claimed ✓" : "Claim Gift"}
       </button>
 
       {claimError && (

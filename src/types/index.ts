@@ -41,6 +41,10 @@ export interface Gift {
   recipientEmail?: string;
   amountNgn: number;
   amountUsdc: string; // on-chain amount as string to preserve precision
+  /** Currency actually charged: "ngn" (Paystack) or "usd"/"gbp"/"eur" (Stripe). Issue #527. */
+  paymentCurrency?: string;
+  /** Amount charged in paymentCurrency major units, locked at order creation. Issue #527. */
+  paymentAmount?: number;
   message?: string;
   mediaUrl?: string;
   /** Background theme id selected in the gift wizard (see lib/giftThemes). */

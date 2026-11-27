@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import pool from "@/lib/db";
 import { verifyOtp } from "@/lib/otp";
 import { AppError } from "@/server/errors";
@@ -9,6 +10,8 @@ import {
   redactGiftsForErasedSender,
 } from "./gift.service";
 import { getTransactionHistory } from "./transaction-history.service";
+import { serverConfig } from "@/server/config";
+import { sendNotification, NotificationChannel } from "./notification.service";
 import type { Gift, GiftStatus } from "@/types";
 
 /**
@@ -215,5 +218,187 @@ export async function deleteUserData(ctx: RequestContext, otp: string): Promise<
     ipAddress: ctx.ipAddress,
     userAgent: ctx.userAgent,
     metadata: { redactedGifts },
+  });
+}
+
+// ─── Grace-period account deletion (Issue #516) ───────────────────────────────
+
+/** Statuses with money in flight — a scheduled deletion must wait for them. */
+const DELETION_GRACE_PERIOD_DAYS = 30;
+
+interface UserContactRow {
+  id: string;
+  phone: string;
+  email: string | null;
+}
+
+/**
+ * Initiates account deletion: sets `scheduled_deletion_at` 30 days out and
+ * emails/SMSes a reactivation (cancel) link. No PII is touched yet — the
+ * permanent purge happens in {@link purgeExpiredAccountDeletions} once the
+ * grace period elapses. Re-verifies phone ownership via a fresh OTP first.
+ *
+ * @throws {@link AppError} `VERIFICATION_FAILED` (401) if the OTP is wrong.
+ * @throws {@link AppError} `ACCOUNT_HAS_ACTIVE_GIFTS` (409) while any sent gift
+ *   still has money in flight.
+ */
+export async function scheduleAccountDeletion(
+  ctx: RequestContext,
+  otp: string
+): Promise<{ scheduledDeletionAt: string }> {
+  await createAuditLog({
+    eventType: "data_deletion_requested",
+    userId: ctx.userId,
+    ipAddress: ctx.ipAddress,
+    userAgent: ctx.userAgent,
+  });
+
+  const verification = await verifyOtp(ctx.phone, otp);
+  if (!verification.success) {
+    await rejectDeletion(
+      ctx,
+      "verification_failed",
+      new AppError("VERIFICATION_FAILED", "We couldn't verify that code. Please try again.", 401)
+    );
+  }
+
+  const active = (await getGiftsBySender(ctx.userId)).filter((g) =>
+    ACTIVE_GIFT_STATUSES.has(g.status)
+  );
+  if (active.length > 0) {
+    await rejectDeletion(
+      ctx,
+      "active_gifts",
+      new AppError(
+        "ACCOUNT_HAS_ACTIVE_GIFTS",
+        `You have ${active.length} gift(s) still in progress. Cancel them or wait until they are claimed before deleting your account.`,
+        409
+      )
+    );
+  }
+
+  const scheduledDeletionAt = new Date(
+    Date.now() + DELETION_GRACE_PERIOD_DAYS * 24 * 60 * 60 * 1000
+  );
+  const cancelToken = randomUUID();
+
+  const { rows } = await pool.query<UserContactRow>(
+    `UPDATE users
+     SET scheduled_deletion_at = $1, deletion_cancel_token = $2, updated_at = NOW()
+     WHERE id = $3 AND deleted_at IS NULL
+     RETURNING id, phone, email`,
+    [scheduledDeletionAt.toISOString(), cancelToken, ctx.userId]
+  );
+
+  if (rows.length === 0) {
+    throw new AppError("NOT_FOUND", "User not found", 404);
+  }
+
+  const cancelUrl = `${serverConfig.app.url}/account/deletion/cancel?token=${cancelToken}`;
+  const contact = rows[0];
+
+  if (contact.email) {
+    await sendNotification(
+      NotificationChannel.Email,
+      { type: "account_deletion_scheduled", to: contact.email, cancelUrl },
+      { dedupKey: `account-deletion:email:${cancelToken}` }
+    );
+  } else {
+    await sendNotification(
+      NotificationChannel.Sms,
+      { type: "account_deletion_scheduled", phone: contact.phone, cancelUrl },
+      { dedupKey: `account-deletion:sms:${cancelToken}` }
+    );
+  }
+
+  await recordRequest(ctx, "deletion", "completed", "grace_period_scheduled");
+  await createAuditLog({
+    eventType: "data_deletion_completed",
+    userId: ctx.userId,
+    ipAddress: ctx.ipAddress,
+    userAgent: ctx.userAgent,
+    metadata: { scheduledDeletionAt: scheduledDeletionAt.toISOString(), status: "pending_grace_period" },
+  });
+
+  return { scheduledDeletionAt: scheduledDeletionAt.toISOString() };
+}
+
+/**
+ * Cancels a pending account deletion via the single-use token issued by
+ * {@link scheduleAccountDeletion}. Clears `scheduled_deletion_at` so the
+ * purge job skips this account.
+ */
+export async function cancelAccountDeletion(token: string): Promise<{ userId: string } | null> {
+  const { rows } = await pool.query<{ id: string }>(
+    `UPDATE users
+     SET scheduled_deletion_at = NULL, deletion_cancel_token = NULL, updated_at = NOW()
+     WHERE deletion_cancel_token = $1 AND deleted_at IS NULL
+     RETURNING id`,
+    [token]
+  );
+  if (rows.length === 0) return null;
+
+  const userId = rows[0].id;
+  await createAuditLog({ eventType: "data_deletion_rejected", userId, metadata: { reason: "cancelled_by_user" } });
+  return { userId };
+}
+
+/**
+ * Cron entry point: permanently anonymises every account whose grace period
+ * has elapsed. Reuses the same PII-overwrite + cascading redaction logic as
+ * the original immediate-deletion flow, so financial records stay linked
+ * but personal identifiers are gone.
+ */
+export async function purgeExpiredAccountDeletions(): Promise<{ purged: number }> {
+  const { rows } = await pool.query<{ id: string; phone: string }>(
+    `SELECT id, phone FROM users
+     WHERE scheduled_deletion_at IS NOT NULL
+       AND scheduled_deletion_at <= NOW()
+       AND deleted_at IS NULL`
+  );
+
+  let purged = 0;
+  for (const row of rows) {
+    try {
+      await purgeOneAccount(row.id, row.phone);
+      purged++;
+    } catch (err) {
+      console.error(`[privacy] failed to purge account ${row.id}:`, (err as Error).message);
+    }
+  }
+  return { purged };
+}
+
+async function purgeOneAccount(userId: string, phone: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("DELETE FROM user_notification_preferences WHERE user_id = $1", [userId]);
+    await client.query("DELETE FROM known_devices WHERE user_id = $1", [userId]);
+    await client.query(
+      "UPDATE gift_invitations SET recipient_phone = '[redacted]' WHERE recipient_phone_hash = $1",
+      [hashPhone(phone)]
+    );
+    await client.query(
+      `UPDATE users
+       SET phone = 'deleted:' || id, name = 'Deleted user', email = NULL,
+           scheduled_deletion_at = NULL, deletion_cancel_token = NULL,
+           deleted_at = NOW(), updated_at = NOW()
+       WHERE id = $1`,
+      [userId]
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  const redactedGifts = await redactGiftsForErasedSender(userId);
+  await createAuditLog({
+    eventType: "data_deletion_completed",
+    userId,
+    metadata: { redactedGifts, status: "purged" },
   });
 }

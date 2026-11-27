@@ -9,14 +9,17 @@ const customConfig = {
   moduleNameMapper: {
     "^@/(.*)$": "<rootDir>/src/$1",
   },
-  // Exclude e2e (Playwright) and DB integration tests from Jest runs
+  // Exclude e2e (Playwright) from Jest runs.
+  // DB integration tests (including the cron route integration suite) are NOT
+  // excluded here — they run in CI against a Postgres service container.
   testPathIgnorePatterns: [
     "<rootDir>/node_modules/",
     "<rootDir>/.next/",
     "<rootDir>/e2e/",
-    "<rootDir>/src/app/api/v1/payments/__tests__/webhook.integration.test.ts",
   ],
-  // Route handler tests and node-specific tests need the node environment
+  // Route handler tests and node-specific tests need the node environment.
+  // Integration tests opt into the node environment via the
+  // `@jest-environment node` docblock (see src/app/api/v1/cron/__tests__/).
   testEnvironmentOptions: {},
   // Per-file environment overrides via docblock: @jest-environment node
   collectCoverageFrom: ["src/**/*.{ts,tsx}", "!src/**/*.d.ts"],
@@ -89,10 +92,10 @@ const customConfig = {
 
     // ── Core services ─────────────────────────────────────────────────────────
     "./src/server/services/gift.service.ts": {
-      branches: 75,
-      functions: 75,
-      lines: 75,
-      statements: 75,
+      branches: 90,
+      functions: 90,
+      lines: 90,
+      statements: 90,
     },
     "./src/server/services/claim.service.ts": {
       branches: 75,

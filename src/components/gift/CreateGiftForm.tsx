@@ -12,9 +12,8 @@ import { GiftPreview } from "./GiftPreview";
 import { GiftPreviewCard } from "./GiftPreviewCard";
 import { useState } from "react";
 import { useCsrf } from "@/hooks/useCsrf";
-import { formatNGN } from "@/lib/currency";
-import { isAmbiguousDstTransition } from "@/lib/dateFormat";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { formatNGN, ngnFromUsd, usdFromNgn } from "@/lib/currency";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { GiftFlowErrorBoundary } from "./GiftFlowErrorBoundary";
 import styles from "./CreateGiftForm.module.css";
 
@@ -24,6 +23,35 @@ const GIFT_MAX_AMOUNT_NGN = 5_000_000;
 const GIFT_DAILY_LIMIT_NGN = 1_000_000;
 
 type Step = "form" | "preview";
+type Currency = "NGN" | "USD";
+
+interface ExchangeRateQuote {
+  ngnPerUsdc: number;
+  fetchedAt: string;
+}
+
+/**
+ * Fetches the live NGN/USDC quote. A 1-NGN quote is requested so the response
+ * yields the rate directly; `ngnPerUsdc` is derived from the USDC equivalent.
+ */
+async function fetchExchangeRateQuote(): Promise<ExchangeRateQuote> {
+  const res = await fetch("/api/v1/exchange-rate/quote?ngn=1");
+  if (!res.ok) throw new Error("Failed to fetch exchange rate");
+  const json = await res.json();
+  const usdc = Number(json.data?.usdc);
+  if (!Number.isFinite(usdc) || usdc <= 0) throw new Error("Invalid exchange rate");
+  return {
+    ngnPerUsdc: 1 / usdc,
+    fetchedAt: json.data?.fetchedAt ?? new Date().toISOString(),
+  };
+}
+
+/** Formats an ISO timestamp as HH:MM in the user's local timezone. */
+function formatRateTime(iso: string): string {
+  const date = new Date(iso);
+  if (isNaN(date.getTime())) return "--:--";
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+}
 
 /**
  * Returns true when the supplied datetime-local string falls within a
@@ -61,6 +89,10 @@ function CreateGiftFormContent() {
   // Raw datetime-local value — the form stores ISO for the shared Zod schema,
   // but the DST gap check needs the wall-clock time the user typed.
   const [unlockLocal, setUnlockLocal] = useState("");
+  // Currency the amount input is displayed in; the form value stays in NGN.
+  const [currency, setCurrency] = useState<Currency>("NGN");
+  // Amount as typed in the currently selected display currency.
+  const [displayAmount, setDisplayAmount] = useState("");
 
   const { csrfFetch } = useCsrf();
   const queryClient = useQueryClient();
@@ -69,6 +101,8 @@ function CreateGiftFormContent() {
     register,
     handleSubmit,
     getValues,
+    setValue,
+    watch,
     formState: { errors, isValid },
   } = useForm<CreateGiftInput>({
     // Same schema the API validates against (src/types/schemas.ts).
@@ -82,6 +116,60 @@ function CreateGiftFormContent() {
   // Destructure the phone field's react-hook-form bindings so we can pass them
   // to PhoneInput separately (it uses forwardRef + onChange/onBlur callbacks).
   const phoneFieldProps = register("recipientPhone");
+
+  // Live exchange rate — only fetched once the user switches to USD so NGN-only
+  // users never pay for the extra request.
+  const {
+    data: rateQuote,
+    isError: rateError,
+  } = useQuery({
+    queryKey: ["exchange-rate", "quote"],
+    queryFn: fetchExchangeRateQuote,
+    enabled: currency === "USD",
+    staleTime: 60_000,
+  });
+
+  const ngnPerUsdc = rateQuote?.ngnPerUsdc;
+
+  /** Converts the typed display amount into NGN and writes it to the form. */
+  const syncAmountNgn = (raw: string, from: Currency, rate: number | undefined) => {
+    if (raw.trim() === "") {
+      setValue("amountNgn", NaN, { shouldValidate: true });
+      return;
+    }
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) {
+      setValue("amountNgn", NaN, { shouldValidate: true });
+      return;
+    }
+    const ngn = from === "USD" && rate ? ngnFromUsd(parsed, rate) : parsed;
+    setValue("amountNgn", ngn, { shouldValidate: true });
+  };
+
+  const onAmountChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const raw = e.target.value;
+    setDisplayAmount(raw);
+    syncAmountNgn(raw, currency, ngnPerUsdc);
+  };
+
+  const onToggleCurrency = () => {
+    const next: Currency = currency === "NGN" ? "USD" : "NGN";
+    const currentNgn = Number(getValues("amountNgn"));
+    if (Number.isFinite(currentNgn) && currentNgn > 0 && ngnPerUsdc) {
+      const converted =
+        next === "USD" ? usdFromNgn(currentNgn, ngnPerUsdc) : ngnFromUsd(currentNgn, ngnPerUsdc);
+      // For NGN→USD we already hold the NGN value; for USD→NGN the typed value
+      // was USD, so convert it back to NGN for submission.
+      const nextDisplay = String(converted);
+      setDisplayAmount(nextDisplay);
+      setValue("amountNgn", next === "USD" ? currentNgn : ngnFromUsd(converted, ngnPerUsdc), {
+        shouldValidate: true,
+      });
+    } else {
+      setDisplayAmount("");
+    }
+    setCurrency(next);
+  };
 
   // useMutation for gift creation — invalidates the gifts cache on success so
   // the dashboard reflects the new gift without a manual reload.
@@ -175,6 +263,13 @@ function CreateGiftFormContent() {
     setError(null);
     setApiError(null);
     const data = getValues();
+    // The form always stores NGN; guard against a stale USD display value.
+    if (currency === "USD" && ngnPerUsdc) {
+      const parsed = Number(displayAmount);
+      if (Number.isFinite(parsed)) {
+        data.amountNgn = ngnFromUsd(parsed, ngnPerUsdc);
+      }
+    }
     createGiftMutation.mutate(data);
   };
 
@@ -222,16 +317,39 @@ function CreateGiftFormContent() {
           defaultNigerian
         />
 
-        {/* Amount — limits enforced in Zod schema, mirrored here (#270) */}
-        <Input
-          label="Gift Amount (₦)"
-          type="number"
-          placeholder="5000"
-          min={GIFT_MIN_AMOUNT_NGN}
-          max={GIFT_MAX_AMOUNT_NGN}
-          error={errors.amountNgn?.message}
-          {...register("amountNgn", { valueAsNumber: true })}
-        />
+        {/* Amount — limits enforced in Zod schema, mirrored here (#270).
+            The input displays the selected currency; the form value is NGN. */}
+        <div className={styles.amountRow}>
+          <Input
+            label={`Gift Amount (${currency === "NGN" ? "₦" : "$"})`}
+            type="number"
+            placeholder={currency === "NGN" ? "5000" : "5"}
+            min={currency === "NGN" ? GIFT_MIN_AMOUNT_NGN : undefined}
+            max={currency === "NGN" ? GIFT_MAX_AMOUNT_NGN : undefined}
+            step={currency === "USD" ? "0.01" : undefined}
+            error={errors.amountNgn?.message}
+            value={displayAmount}
+            onChange={onAmountChange}
+            onBlur={() => syncAmountNgn(displayAmount, currency, ngnPerUsdc)}
+          />
+          <button
+            type="button"
+            className={styles.currencyToggle}
+            onClick={onToggleCurrency}
+            aria-label={`Switch amount currency to ${currency === "NGN" ? "USD" : "NGN"}`}
+          >
+            {currency === "NGN" ? "₦ NGN" : "$ USD"}
+          </button>
+        </div>
+        {currency === "USD" && (
+          <p className={styles.rateLabel} aria-live="polite">
+            {rateError
+              ? "Exchange rate unavailable — enter amount in NGN"
+              : rateQuote
+                ? `Rate as of ${formatRateTime(rateQuote.fetchedAt)}`
+                : "Fetching rate…"}
+          </p>
+        )}
         <p className="input-hint">
           Min {formatNGN(GIFT_MIN_AMOUNT_NGN)} · Max {formatNGN(GIFT_MAX_AMOUNT_NGN)} · Daily limit{" "}
           {formatNGN(GIFT_DAILY_LIMIT_NGN)}

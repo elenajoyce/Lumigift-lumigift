@@ -1,6 +1,8 @@
 "use client";
 
 import { GIFT_THEMES, giftThemeStyle, type GiftThemeId } from "@/lib/giftThemes";
+import type { CreateGiftInput } from "@/lib/types";
+import { GiftPreviewCard } from "./GiftPreviewCard";
 import styles from "./ThemePicker.module.css";
 
 interface ThemePickerProps {
@@ -16,6 +18,7 @@ export function ThemePicker({ value, onChange }: ThemePickerProps) {
       <div className={styles.grid} role="radiogroup" aria-label="Card theme">
         {GIFT_THEMES.map((theme) => {
           const selected = value === theme.id;
+          const preview: Partial<CreateGiftInput> = { themeId: theme.id };
           return (
             <button
               key={theme.id}
@@ -26,6 +29,9 @@ export function ThemePicker({ value, onChange }: ThemePickerProps) {
               style={giftThemeStyle(theme.id)}
               onClick={() => onChange(theme.id)}
             >
+              <span className={styles.preview} aria-hidden="true">
+                <GiftPreviewCard gift={preview} onEdit={() => {}} />
+              </span>
               <span className={styles.label}>{theme.label}</span>
             </button>
           );

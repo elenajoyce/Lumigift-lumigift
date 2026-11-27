@@ -6,8 +6,8 @@ import type { Gift } from "@/types";
 import { GiftCard } from "./GiftCard";
 import styles from "./VirtualGiftList.module.css";
 
-/** Mirrors the dashboard grid: `repeat(auto-fill, minmax(300px, 1fr))`. */
-const MIN_CARD_WIDTH = 300;
+/** Mirrors the dashboard grid: `repeat(auto-fill, minmax(min(300px,100%), 1fr))`. */
+const MIN_CARD_WIDTH = 280;
 const GAP = 24;
 const ESTIMATED_ROW_HEIGHT = 220;
 

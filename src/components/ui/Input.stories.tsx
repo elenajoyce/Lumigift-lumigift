@@ -5,6 +5,16 @@ const meta: Meta<typeof Input> = {
   title: "UI/Input",
   component: Input,
   tags: ["autodocs"],
+  parameters: {
+    a11y: {
+      config: {
+        rules: [
+          { id: "label", enabled: true },
+          { id: "aria-input-field-name", enabled: true },
+        ],
+      },
+    },
+  },
   argTypes: {
     type: {
       control: "select",
@@ -31,6 +41,13 @@ export const Default: Story = {
     placeholder: "you@example.com",
     type: "email",
   },
+  parameters: {
+    a11y: {
+      config: {
+        rules: [{ id: "label", enabled: true }],
+      },
+    },
+  },
 };
 
 export const WithError: Story = {
@@ -39,6 +56,16 @@ export const WithError: Story = {
     placeholder: "you@example.com",
     type: "email",
     error: "Please enter a valid email address",
+  },
+  parameters: {
+    a11y: {
+      config: {
+        rules: [
+          { id: "label", enabled: true },
+          { id: "aria-input-field-name", enabled: true },
+        ],
+      },
+    },
   },
 };
 
@@ -49,6 +76,13 @@ export const WithHint: Story = {
     type: "tel",
     hint: "We'll never share your number with third parties",
   },
+  parameters: {
+    a11y: {
+      config: {
+        rules: [{ id: "label", enabled: true }],
+      },
+    },
+  },
 };
 
 export const Disabled: Story = {
@@ -56,5 +90,12 @@ export const Disabled: Story = {
     label: "Disabled input",
     placeholder: "Cannot edit",
     disabled: true,
+  },
+  parameters: {
+    a11y: {
+      config: {
+        rules: [{ id: "label", enabled: true }],
+      },
+    },
   },
 };

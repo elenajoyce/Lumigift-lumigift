@@ -178,6 +178,85 @@ describe("DateTimeInput – min/max semantics", () => {
   });
 });
 
+describe("DateTimeInput – timezone conversion (#481)", () => {
+  const originalGetTimezoneOffset = Date.prototype.getTimezoneOffset;
+
+  afterEach(() => {
+    Date.prototype.getTimezoneOffset = originalGetTimezoneOffset;
+  });
+
+  /**
+   * Force the runtime's local timezone offset (in minutes east of UTC).
+   * `getTimezoneOffset()` returns minutes *behind* UTC, so we negate.
+   */
+  function setOffsetMinutesEast(minutesEast: number) {
+    Date.prototype.getTimezoneOffset = () => -minutesEast;
+  }
+
+  it("converts WAT (UTC+1) local input to the correct UTC ISO string", () => {
+    setOffsetMinutesEast(60); // WAT = UTC+1
+    const handleChange = jest.fn();
+    render(<DateTimeInput label="Unlock Date" onChange={handleChange} />);
+    const input = screen.getByLabelText("Unlock Date");
+
+    // 10:00 local in WAT is 09:00 UTC
+    fireEvent.change(input, { target: { value: "2025-12-25T10:00" } });
+
+    expect(handleChange).toHaveBeenCalledTimes(1);
+    expect(handleChange.mock.calls[0][0]).toBe("2025-12-25T09:00:00.000Z");
+  });
+
+  it("converts UTC-5 local input to the correct UTC ISO string", () => {
+    setOffsetMinutesEast(-300); // UTC-5 (e.g. EST)
+    const handleChange = jest.fn();
+    render(<DateTimeInput label="Unlock Date" onChange={handleChange} />);
+    const input = screen.getByLabelText("Unlock Date");
+
+    // 10:00 local in UTC-5 is 15:00 UTC
+    fireEvent.change(input, { target: { value: "2025-12-25T10:00" } });
+
+    expect(handleChange).toHaveBeenCalledTimes(1);
+    expect(handleChange.mock.calls[0][0]).toBe("2025-12-25T15:00:00.000Z");
+  });
+
+  it("converts UTC+5:30 (IST) local input to the correct UTC ISO string", () => {
+    setOffsetMinutesEast(330); // UTC+5:30
+    const handleChange = jest.fn();
+    render(<DateTimeInput label="Unlock Date" onChange={handleChange} />);
+    const input = screen.getByLabelText("Unlock Date");
+
+    // 10:00 local in UTC+5:30 is 04:30 UTC
+    fireEvent.change(input, { target: { value: "2025-12-25T10:00" } });
+
+    expect(handleChange.mock.calls[0][0]).toBe("2025-12-25T04:30:00.000Z");
+  });
+
+  it("displays a UTC value as local time in WAT (UTC+1)", () => {
+    setOffsetMinutesEast(60);
+    render(<DateTimeInput label="Unlock Date" value="2025-12-25T09:00:00.000Z" />);
+    const input = screen.getByLabelText("Unlock Date") as HTMLInputElement;
+
+    // 09:00 UTC should display as 10:00 local in WAT
+    expect(input.value).toBe("2025-12-25T10:00");
+  });
+
+  it("displays a UTC value as local time in UTC-5", () => {
+    setOffsetMinutesEast(-300);
+    render(<DateTimeInput label="Unlock Date" value="2025-12-25T15:00:00.000Z" />);
+    const input = screen.getByLabelText("Unlock Date") as HTMLInputElement;
+
+    // 15:00 UTC should display as 10:00 local in UTC-5
+    expect(input.value).toBe("2025-12-25T10:00");
+  });
+
+  it("shows a timezone indicator alongside the local time", () => {
+    setOffsetMinutesEast(60);
+    render(<DateTimeInput label="Unlock Date" />);
+    // A timezone indicator (e.g. "UTC+1", "GMT+1", or an abbreviation) must be shown
+    expect(screen.getByText(/UTC[+-]\d|GMT[+-]\d|[A-Z]{2,5}/)).toBeInTheDocument();
+  });
+});
+
 describe("DateTimeInput – locale and timezone edge cases", () => {
   it("returns a valid UTC ISO string for any local datetime-local value", () => {
     const handleChange = jest.fn();

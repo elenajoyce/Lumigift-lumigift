@@ -12,7 +12,7 @@
 
 import { useEffect } from "react";
 import { useSession } from "next-auth/react";
-import { useRouter, usePathname } from "next/navigation";
+import { useRouter, usePathname, useSearchParams } from "next/navigation";
 
 type GuardStatus = "loading" | "authenticated" | "unauthenticated";
 
@@ -43,14 +43,19 @@ export function useAuthGuard({ loginPath = "/auth/login" }: UseAuthGuardOptions 
   const { status } = useSession();
   const router = useRouter();
   const pathname = usePathname();
+  const searchParams = useSearchParams();
 
   useEffect(() => {
     if (status === "unauthenticated") {
+      // Preserve the full current URL (pathname + query string) so deep
+      // links like /claim?token=... survive the auth redirect.
+      const search = searchParams?.toString() ?? "";
+      const currentUrl = search ? `${pathname}?${search}` : pathname;
       // Build a safe, validated callbackUrl
-      const callbackUrl = isSafeReturnUrl(pathname) ? pathname : "/dashboard";
+      const callbackUrl = isSafeReturnUrl(currentUrl) ? currentUrl : "/dashboard";
       router.replace(`${loginPath}?callbackUrl=${encodeURIComponent(callbackUrl)}`);
     }
-  }, [status, router, pathname, loginPath]);
+  }, [status, router, pathname, searchParams, loginPath]);
 
   return { status: status as GuardStatus };
 }

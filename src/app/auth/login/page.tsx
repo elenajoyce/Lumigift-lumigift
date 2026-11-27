@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useId, useEffect } from "react";
+import { useState, useId, useEffect, useRef, useCallback } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { signIn } from "next-auth/react";
 import {
@@ -14,6 +14,9 @@ import { useCsrf } from "@/hooks/useCsrf";
 import styles from "./page.module.css";
 
 type Step = "phone" | "otp" | "passkey-offer";
+
+const RESEND_COOLDOWN_SECONDS = 60;
+const MAX_ATTEMPTS = 5;
 
 /**
  * Validates that a callbackUrl is safe (same origin, relative path only).

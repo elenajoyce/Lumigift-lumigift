@@ -248,6 +248,65 @@ export async function sendGiftInvitation(
  * @returns Resolves when the SMS has been dispatched to Termii.
  * @throws If the Termii API returns a non-2xx response.
  */
+/**
+ * Notifies the sender that their on-chain escrow has been claimed by the
+ * recipient (dispatched from the Stellar event indexer, issue #517).
+ *
+ * @param phone - E.164-formatted destination phone number (sender's).
+ * @param recipientName - Display name of the recipient who claimed the gift.
+ * @param amountUsdc - The gift amount in USDC.
+ */
+export async function sendGiftClaimedAlert(
+  phone: string,
+  recipientName: string,
+  amountUsdc: string
+): Promise<void> {
+  await termiiClient.post("/sms/send", {
+    to: phone,
+    from: serverConfig.termii.senderId,
+    sms: `Lumigift: 🎉 ${recipientName} just claimed your ${amountUsdc} USDC gift!`,
+    type: "plain",
+    channel: "generic",
+    api_key: serverConfig.termii.apiKey,
+  });
+}
+
+/**
+ * Notifies the recipient that their gift escrow has been funded on-chain
+ * (dispatched from the Stellar event indexer, issue #517).
+ *
+ * @param phone - E.164-formatted destination phone number (recipient's).
+ * @param amountUsdc - The gift amount in USDC.
+ */
+export async function sendGiftFundedAlert(phone: string, amountUsdc: string): Promise<void> {
+  await termiiClient.post("/sms/send", {
+    to: phone,
+    from: serverConfig.termii.senderId,
+    sms: `Lumigift: 🎁 A ${amountUsdc} USDC gift has been funded for you! Open the app to claim it.`,
+    type: "plain",
+    channel: "generic",
+    api_key: serverConfig.termii.apiKey,
+  });
+}
+
+/**
+ * Sent when a user requests account deletion (Issue #516). Gives them a
+ * reactivation link to cancel the scheduled deletion within the 30-day
+ * grace period.
+ */
+export async function sendAccountDeletionAlert(phone: string, cancelUrl: string): Promise<void> {
+  await termiiClient.post("/sms/send", {
+    to: phone,
+    from: serverConfig.termii.senderId,
+    sms:
+      `Lumigift: Your account is scheduled for deletion in 30 days. ` +
+      `Didn't mean to? Cancel here: ${cancelUrl}`,
+    type: "plain",
+    channel: "generic",
+    api_key: serverConfig.termii.apiKey,
+  });
+}
+
 export async function sendExpiryGraceReminder(
   phone: string,
   amountUsdc: string,
@@ -260,6 +319,38 @@ export async function sendExpiryGraceReminder(
       `Lumigift: Your ${amountUsdc} USDC gift has expired. 🎁\n` +
       `Claim it before ${refundDueAt.toUTCString()} or it will be refunded to the sender: ` +
       `${serverConfig.app.url}/claim`,
+    type: "plain",
+    channel: "generic",
+    api_key: serverConfig.termii.apiKey,
+  });
+}
+
+/**
+ * Sends an occasion reminder SMS to the occasion owner, with a deep link to
+ * `/send` pre-filled with the saved contact so they can start a gift in one
+ * tap. Issue #519.
+ *
+ * @param phone - E.164-formatted destination phone number (the occasion owner).
+ * @param contactName - The saved contact's name for this occasion.
+ * @param label - The occasion label (e.g. "Birthday", "Anniversary").
+ * @param occasionId - Used to pre-fill the `/send` link.
+ * @param daysUntil - How many days remain until the occasion (7 or 1).
+ */
+export async function sendOccasionReminder(
+  phone: string,
+  contactName: string,
+  label: string,
+  occasionId: string,
+  daysUntil: number
+): Promise<void> {
+  const when = daysUntil <= 1 ? "tomorrow" : `in ${daysUntil} days`;
+  const link = `${serverConfig.app.url}/send?occasionId=${encodeURIComponent(occasionId)}`;
+  await termiiClient.post("/sms/send", {
+    to: phone,
+    from: serverConfig.termii.senderId,
+    sms:
+      `Lumigift: ${contactName}'s ${label} is ${when}! 🎁\n` +
+      `Send a time-locked gift now: ${link}`,
     type: "plain",
     channel: "generic",
     api_key: serverConfig.termii.apiKey,

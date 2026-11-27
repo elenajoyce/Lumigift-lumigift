@@ -25,6 +25,27 @@ import * as Sentry from "@sentry/nextjs";
 import { logger } from "@/lib/logger";
 import { getRedisClient } from "@/lib/redis";
 
+// ── SLO definitions ───────────────────────────────────────────────────────────
+
+/**
+ * Service Level Objectives surfaced on the SLO dashboards and used by the
+ * error-budget burn-rate alerts. Keep these in sync with
+ * docs/ops/slo-dashboards.md.
+ */
+export const SLO = {
+  /** Availability: proportion of successful requests. */
+  availability: { target: 0.999, window: "30d" },
+  /** Latency: p95 request duration must stay at or below this (ms). */
+  latencyP95Ms: { target: 500, window: "30d" },
+  /** Payment success rate: successful payments / attempted payments. */
+  paymentSuccessRate: { target: 0.995, window: "30d" },
+} as const;
+
+/** Burn-rate threshold that triggers the error-budget alert. */
+export const SLO_BURN_RATE_ALERT_THRESHOLD = 2;
+/** Window over which the burn rate is evaluated for alerting. */
+export const SLO_BURN_RATE_ALERT_WINDOW = "1h";
+
 // ── Timer ─────────────────────────────────────────────────────────────────────
 
 /**
@@ -124,6 +145,98 @@ export async function recordDeadLetter(
   );
 }
 
+// ── SLO metrics ───────────────────────────────────────────────────────────────
+
+/**
+ * Records the outcome of an HTTP request for availability SLOs.
+ *
+ * Emits a structured log line with `metric: "slo.request"` and a numeric
+ * `success` flag (1/0) so dashboards can compute the availability ratio and
+ * error-budget burn rate. No request bodies, headers, or PII are logged.
+ *
+ * @param route      - Normalised route label, e.g. "POST /api/gifts".
+ * @param statusCode - HTTP status code returned to the client.
+ * @param durationMs - Total request duration in milliseconds.
+ */
+export function recordRequestOutcome(
+  route: string,
+  statusCode: number,
+  durationMs: number
+): void {
+  const success = statusCode >= 200 && statusCode < 500 ? 1 : 0;
+  logger.info(
+    { metric: "slo.request", route, statusCode, durationMs, success },
+    "[slo] request"
+  );
+}
+
+/**
+ * Records a payment attempt outcome for the payment success-rate SLO.
+ *
+ * @param provider   - Payment provider identifier, e.g. "paystack".
+ * @param success    - Whether the payment ultimately succeeded.
+ * @param durationMs - Time from initiation to terminal state, if known.
+ */
+export function recordPaymentOutcome(
+  provider: string,
+  success: boolean,
+  durationMs?: number
+): void {
+  logger.info(
+    {
+      metric: "slo.payment",
+      provider,
+      success: success ? 1 : 0,
+      ...(durationMs !== undefined ? { durationMs } : {}),
+    },
+    "[slo] payment outcome"
+  );
+}
+
+// ── Cron heartbeat ────────────────────────────────────────────────────────────
+
+/**
+ * Pings the external cron monitor (Healthchecks.io or equivalent) to confirm
+ * a cron run *completed* successfully. Call this only after the job's work
+ * has finished — never on invocation — so missed or partial runs are detected.
+ *
+ * Best-effort: failures to ping are logged but never thrown, so monitoring
+ * outages cannot break the cron itself.
+ *
+ * @param job - Identifier for the cron job, e.g. "cron/unlock".
+ */
+export async function pingCronHeartbeat(job: string): Promise<void> {
+  const baseUrl = process.env.HEALTHCHECKS_PING_URL;
+  if (!baseUrl) {
+    logger.warn({ metric: "cron.heartbeat", job, status: "skipped" }, "[cron] heartbeat not configured");
+    return;
+  }
+
+  // Map job identifiers to their Healthchecks.io check slugs.
+  const slug = job.replace(/^cron\//, "").replace(/\//g, "-");
+  const url = `${baseUrl.replace(/\/$/, "")}/${slug}`;
+
+  try {
+    const res = await fetch(url, { method: "GET", cache: "no-store" });
+    if (!res.ok) {
+      logger.warn(
+        { metric: "cron.heartbeat", job, status: "failed", httpStatus: res.status },
+        "[cron] heartbeat ping failed"
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      {
+        metric: "cron.heartbeat",
+        job,
+        status: "error",
+        reason: err instanceof Error ? err.message : String(err),
+      },
+      "[cron] heartbeat ping error"
+    );
+  }
+}
+
 // ── Webhook metrics ───────────────────────────────────────────────────────────
 
 /**
@@ -199,4 +312,101 @@ export function recordStatusTransition(
     { metric: "gift.status_transition", giftId, fromStatus, toStatus, trigger },
     "[gift] status changed"
   );
+}
+
+// ── Contract TTL keeper metrics ───────────────────────────────────────────────
+
+/**
+ * Emits a structured warning and captures a Sentry message when a contract's
+ * instance storage TTL drops below the safety buffer (7 days). This is the
+ * signal that fires the on-call alert for the TTL keeper service.
+ *
+ * @param job              - Identifier for the keeper job, e.g. "cron/ttl-keeper".
+ * @param contractId       - The escrow contract ID whose TTL is low.
+ * @param remainingLedgers - Remaining TTL in ledgers.
+ * @param remainingDays    - Remaining TTL converted to days (approx).
+ */
+export function recordTtlAlert(
+  job: string,
+  contractId: string,
+  remainingLedgers: number,
+  remainingDays: number
+): void {
+  logger.warn(
+    {
+      metric: "ttl.alert",
+      job,
+      contractId,
+      remainingLedgers,
+      remainingDays,
+      status: "below_buffer",
+    },
+    "[ttl] contract TTL below safety buffer"
+  );
+
+  Sentry.withScope((scope) => {
+    scope.setTag("metric", "ttl.alert");
+    scope.setTag("job", job);
+    scope.setExtra("contractId", contractId);
+    scope.setExtra("remainingLedgers", remainingLedgers);
+    scope.setExtra("remainingDays", remainingDays);
+    Sentry.captureMessage(
+      `Contract TTL below 7-day buffer (${remainingDays.toFixed(2)} days remaining)`,
+      "warning"
+    );
+  });
+}
+
+/**
+ * Records the outcome of a daily TTL keeper run, including how many contracts
+ * were extended, how many failed, and the total XLM fee spent. The fee is
+ * tracked so keeper costs can be budgeted and monitored over time.
+ *
+ * @param job        - Identifier for the keeper job, e.g. "cron/ttl-keeper".
+ * @param durationMs - Elapsed time in milliseconds.
+ * @param data       - Safe counters: contractsChecked, contractsExtended,
+ *                     contractsFailed, totalFeeXlm (no PII).
+ */
+export function recordTtlKeeperRun(
+  job: string,
+  durationMs: number,
+  data: {
+    contractsChecked: number;
+    contractsExtended: number;
+    contractsFailed: number;
+    totalFeeXlm: number;
+  }
+): void {
+  const status = data.contractsFailed > 0 ? "partial" : "success";
+  const log = status === "success" ? logger.info.bind(logger) : logger.warn.bind(logger);
+
+  log(
+    {
+      metric: "ttl.keeper_run",
+      job,
+      status,
+      durationMs,
+      contractsChecked: data.contractsChecked,
+      contractsExtended: data.contractsExtended,
+      contractsFailed: data.contractsFailed,
+      totalFeeXlm: data.totalFeeXlm,
+    },
+    status === "success" ? "[ttl] keeper run ok" : "[ttl] keeper run completed with failures"
+  );
+
+  if (data.contractsFailed > 0) {
+    Sentry.withScope((scope) => {
+      scope.setTag("metric", "ttl.keeper_run");
+      scope.setTag("job", job);
+      scope.setExtra("contractsChecked", data.contractsChecked);
+      scope.setExtra("contractsExtended", data.contractsExtended);
+      scope.setExtra("contractsFailed", data.contractsFailed);
+      scope.setExtra("totalFeeXlm", data.totalFeeXlm);
+      scope.setExtra("durationMs", durationMs);
+      Sentry.captureMessage(
+        `TTL keeper: ${data.contractsFailed} contract(s) failed to extend`,
+        "error"
+      );
+    });
+  }
 }

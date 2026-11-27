@@ -102,6 +102,17 @@ export const DateTimeInput = forwardRef<HTMLInputElement, DateTimeInputProps>(
       setDstWarning(localValue ? isAmbiguousDstTransition(localValue) : false);
     }, [localValue]);
 
+    // Human-readable timezone indicator: IANA name plus current UTC offset
+    const timezoneLabel = (() => {
+      const tzName = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const offsetMinutes = -new Date().getTimezoneOffset();
+      const sign = offsetMinutes >= 0 ? "+" : "-";
+      const abs = Math.abs(offsetMinutes);
+      const hours = String(Math.floor(abs / 60)).padStart(2, "0");
+      const minutes = String(abs % 60).padStart(2, "0");
+      return `${tzName} (UTC${sign}${hours}:${minutes})`;
+    })();
+
     // Compute default min: now (prevents selecting past dates)
     const defaultMinLocal = utcIsoToLocalDateTimeValue(new Date().toISOString());
     const minAttr = minUtc ? utcIsoToMinMaxAttr(minUtc) : defaultMinLocal;
@@ -122,7 +133,9 @@ export const DateTimeInput = forwardRef<HTMLInputElement, DateTimeInputProps>(
         onChange?.("");
         return;
       }
-      // Convert local picker value to UTC before surfacing to the consumer
+      // Convert local picker value to UTC before surfacing to the consumer.
+      // The consumer always receives an ISO-8601 UTC string (e.g. "...Z"),
+      // never a local-time value, so the backend stores the correct instant.
       const utcIso = localDateTimeToUtcIso(raw);
       onChange?.(utcIso);
     }
@@ -151,7 +164,7 @@ export const DateTimeInput = forwardRef<HTMLInputElement, DateTimeInputProps>(
 
         {/* Timezone context — always visible so users understand the local offset */}
         <span className={styles.timezone} aria-live="polite">
-          {Intl.DateTimeFormat().resolvedOptions().timeZone}
+          {timezoneLabel}
         </span>
 
         {/* DST ambiguity warning */}

@@ -19,6 +19,45 @@ const MOBILE_BREAKPOINT = 768;
 export function Navbar() {
   const pathname = usePathname();
   const { t, locale, setLocale } = useTranslation();
+  const navRef = useRef<HTMLElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const focusTrapEndRef = useRef<HTMLSpanElement>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  const closeMenu = useCallback(() => {
+    setMenuOpen(false);
+  }, []);
+
+  const handleLinkClick = useCallback(() => {
+    closeMenu();
+  }, [closeMenu]);
+
+  const handleKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLElement>) => {
+      if (event.key === "Escape" && menuOpen) {
+        closeMenu();
+        buttonRef.current?.focus();
+      }
+    },
+    [menuOpen, closeMenu]
+  );
+
+  useEffect(() => {
+    closeMenu();
+  }, [pathname, closeMenu]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+
+    const handleResize = () => {
+      if (window.innerWidth > MOBILE_BREAKPOINT) {
+        closeMenu();
+      }
+    };
+
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, [menuOpen, closeMenu]);
 
   return (
     <header className={styles.header}>
@@ -46,8 +85,8 @@ export function Navbar() {
                 <Link
                   href={href}
                   role="menuitem"
-                  className={`${styles.link} ${active ? styles.linkActive : ""}`}
-                  aria-current={active ? "page" : undefined}
+                  className={`${styles.link} ${isActive ? styles.linkActive : ""}`}
+                  aria-current={isActive ? "page" : undefined}
                   onClick={handleLinkClick}
                 >
                   {t(labelKey)}
@@ -79,6 +118,9 @@ export function Navbar() {
           <li>
             <ThemeToggle />
           </li>
+          <li>
+            <NotificationBell />
+          </li>
           <li role="none">
             <Link
               href="/auth/login"
@@ -86,11 +128,6 @@ export function Navbar() {
               role="menuitem"
               onClick={handleLinkClick}
             >
-          <li>
-            <NotificationBell />
-          </li>
-          <li>
-            <Link href="/auth/login" className="btn btn--primary btn--sm">
               {t("nav.sign_in")}
             </Link>
           </li>

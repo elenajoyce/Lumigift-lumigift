@@ -61,6 +61,18 @@
 .timezone {
   font-size: var(--text-xs);
   color: var(--color-text-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/* UTC offset indicator shown next to the timezone name, e.g. "WAT (UTC+01:00)" */
+.timezoneOffset {
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-muted);
+  opacity: 0.8;
+  white-space: nowrap;
 }
 
 /* Hint text */

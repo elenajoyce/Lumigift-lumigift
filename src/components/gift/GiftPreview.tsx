@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/Button";
 import { ApiErrorBanner, type ApiErrorState } from "@/components/ui/ApiErrorBanner";
 import { formatNGN, formatUSDC } from "@/lib/currency";
 import { formatUnlockDate } from "@/lib/dateFormat";
+import { giftThemeStyle } from "@/lib/giftThemes";
 import styles from "./GiftPreview.module.css";
 
 interface GiftPreviewProps {
@@ -33,7 +34,10 @@ export function GiftPreview({
     usdcEquivalent === "—" || usdcEquivalent === "…" ? usdcEquivalent : formatUSDC(usdcEquivalent);
 
   return (
-    <div className={styles.preview}>
+    <div
+      className={`${styles.preview} gift-theme`}
+      style={giftThemeStyle(data.themeId)}
+    >
       <h2 className={styles.title}>Review Your Gift</h2>
       <p className={styles.subtitle}>Please confirm the details before proceeding to payment.</p>
 

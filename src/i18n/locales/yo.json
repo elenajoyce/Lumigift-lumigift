@@ -12,7 +12,7 @@
     "badge": "Ti a ṣe pẹlu Stellar & USDC",
     "headline_part1": "Awọn ẹbun owo ti ṣi silẹ",
     "headline_part2": "ni ọjọ iyalẹnu",
-    "subheadline": "Fi owo ranṣẹ ti o farasin patapata titi di akoko pipe. Awọn ọjọ-ibi, iranti, Ọjọ Valentine — jẹ ki ẹbun kọọkan jẹ a잊ọ.",
+    "subheadline": "Fi owo ranṣẹ ti o farasin patapata titi di akoko pipe. Awọn ọjọ-ibi, iranti, Ọjọ Valentine — jẹ ki ẹbun kọọkan jẹ aṣeyọri.",
     "cta_send": "Fi Ẹbun Ranṣẹ",
     "cta_how_it_works": "Bii o ṣe n ṣiṣẹ",
     "features_title": "Kini idi Lumigift?",
@@ -25,6 +25,8 @@
     "feature_fees_desc": "Nẹtiwọọki iyara ti Stellar tumọ si pe owo rẹ diẹ sii de olugba.",
     "feature_ngn_title": "Ọna Naira",
     "feature_ngn_desc": "Sanwo pẹlu Naira nipasẹ Paystack. Awọn olugba le yọ owo jade taara si akọọlẹ banki Nigeria wọn.",
+    "features_subtitle": "Ohun gbogbo ti o nilo lati fi awọn ẹbun owo ranṣẹ ni ọna ti o ni aabo ati iyalẹnu.",
+    "steps_subtitle": "Lati ṣiṣẹda si gbigba, eyi ni bii Lumigift ṣe n ṣiṣẹ.",
     "step1_title": "Ṣẹda ẹbun kan",
     "step1_desc": "Tẹ nọmba foonu olugba sii, iye owo ni Naira, ki o yan ọjọ ṣiṣi iyalẹnu.",
     "step2_title": "Sanwo ni aabo",
@@ -48,7 +50,14 @@
     "prev_page": "Oju-iwe ti o kọja",
     "next_page": "Oju-iwe ti o tẹle",
     "no_more_pages": "Ko si awọn oju-iwe diẹ sii",
-    "pagination_label": "Itọkasi itan-akọọlẹ ẹbun"
+    "pagination_label": "Itọkasi itan-akọọlẹ ẹbun",
+    "gift_status_pending": "N duro",
+    "gift_status_claimed": "Ti gba",
+    "gift_status_expired": "Ti pari",
+    "gift_amount": "Iye",
+    "gift_recipient": "Olugba",
+    "gift_open_date": "Ọjọ ṣiṣi",
+    "view_gift": "Wo ẹbun"
   },
   "login": {
     "title_phone": "Wọle si Lumigift",
@@ -69,11 +78,25 @@
     "attempt_warning_many": "Awọn igbiyanju {count} ni o ku.",
     "lockout_message": "Igbiyanju pupọ jù. Jọwọ beere koodu tuntun.",
     "step1_label": "Igbesẹ 1 ti 2: Tẹ nọmba foonu rẹ sii",
-    "step2_label": "Igbesẹ 2 ti 2: Tẹ koodu ijerisi sii"
+    "step2_label": "Igbesẹ 2 ti 2: Tẹ koodu ijerisi sii",
+    "error_invalid_phone": "Jọwọ tẹ nọmba foonu to tọ sii.",
+    "error_invalid_otp": "Koodu ti o tẹ sii ko tọ. Jọwọ gbiyanju lẹẹkansi.",
+    "error_generic": "Nkan kan kuna. Jọwọ gbiyanju lẹẹkansi."
   },
   "send": {
     "title": "Fi Ẹbun Ranṣẹ",
-    "description": "Ṣẹda ẹbun owo ti iwa ti o ṣi silẹ ni ọjọ ti o yan."
+    "description": "Ṣẹda ẹbun owo ti iwa ti o ṣi silẹ ni ọjọ ti o yan.",
+    "recipient_label": "Nọmba foonu olugba",
+    "recipient_placeholder": "+2348012345678",
+    "amount_label": "Iye (Naira)",
+    "amount_placeholder": "5000",
+    "open_date_label": "Ọjọ ṣiṣi",
+    "message_label": "Ifiranṣẹ (iyan)",
+    "message_placeholder": "Fi ifiranṣẹ kekere ranṣẹ pẹlu ẹbun rẹ…",
+    "submit": "Tẹsiwaju si Isanwo",
+    "error_invalid_recipient": "Jọwọ tẹ nọmba foonu olugba to tọ sii.",
+    "error_invalid_amount": "Jọwọ tẹ iye to tọ sii.",
+    "error_invalid_date": "Jọwọ yan ọjọ ṣiṣi to tọ sii."
   },
   "profile": {
     "title": "Profaili",
@@ -95,7 +118,10 @@
     "desc_security": "Awọn koodu OTP ati awọn itaniji iwọle ti o fura — nigbagbogbo.",
     "desc_lifecycle": "Awọn ifitonileti nigbati awọn ẹbun rẹ ti ni inawo, ṣi, tabi gba.",
     "desc_marketing": "Awọn ẹya tuntun, awọn igbega, ati iroyin Lumigift.",
-    "mandatory_notice": "Nigbagbogbo ṣiṣẹ — ko le pa"
+    "mandatory_notice": "Nigbagbogbo ṣiṣẹ — ko le pa",
+    "save_success": "A ti fi awọn ayanfẹ rẹ pamọ.",
+    "save_error": "Kuna lati fi awọn ayanfẹ rẹ pamọ. Jọwọ gbiyanju lẹẹkansi.",
+    "sign_out": "Jade"
   },
   "common": {
     "loading": "Ṣiṣe ṣaja…",
@@ -107,6 +133,14 @@
     "back": "Padà",
     "next": "Tẹle",
     "confirm": "Jẹrisi",
-    "skip_to_main": "Fo si akoonu akọkọ"
+    "skip_to_main": "Fo si akoonu akọkọ",
+    "yes": "Bẹẹni",
+    "no": "Rara",
+    "delete": "Paarẹ",
+    "edit": "Ṣatunkọ",
+    "search": "Wa",
+    "submit": "Fi silẹ",
+    "required": "A nilo eyi",
+    "optional": "Iyan"
   }
 }

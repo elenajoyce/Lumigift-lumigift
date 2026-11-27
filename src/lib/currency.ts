@@ -14,6 +14,8 @@
  * | stroops → NGN          | floor   | Display value never inflates the stroop balance|
  * | NGN → USDC micro-units | floor   | Escrow locks ≤ calculated USDC (never overfund)|
  * | USDC micro-units → NGN | ceiling | Payment always covers the full USDC obligation  |
+ * | USD → NGN (toggle)     | ceiling | NGN equivalent always covers the USD entered   |
+ * | NGN → USD (toggle)     | floor   | Displayed USD never exceeds the NGN entered    |
  *
  * "floor" for escrow-bound conversions guarantees the contract is never
  * overfunded by a rounding artifact.  "ceiling" for payment-bound conversions
@@ -247,4 +249,99 @@ export function usdcToNgn(usdcFloat: CurrencyAmount, ngnPerUsdc: number): number
   // Convert to stroops first, then to NGN via stroopsToNgn (ceiling).
   const stroops = Math.floor(usdc * 10_000_000);
   return stroopsToNgn(stroops, ngnPerUsdc);
+}
+
+// ─── NGN ↔ USD toggle helpers ────────────────────────────────────────────────
+
+/**
+ * Converts a USD amount to NGN using a live exchange rate expressed as
+ * NGN-per-USDC (USD is treated 1:1 with USDC for display purposes).
+ *
+ * Rounding: **ceiling** to the nearest whole kobo, then expressed in NGN — the
+ * NGN equivalent always covers the USD amount the user entered.
+ *
+ * @param usd        - Amount in USD (may be fractional).
+ * @param ngnPerUsdc - Live exchange rate: how many NGN equal 1 USD.
+ * @returns NGN amount (float, ceiling-rounded to nearest kobo).
+ *
+ * @example
+ * // 1 USD = 1500 NGN:
+ * usdToNgn(1, 1500)      // 1500
+ * usdToNgn(0.5, 1500)    // 750
+ * usdToNgn(0.0001, 1500) // 0.15  (ceiling of 0.15)
+ */
+export function usdToNgn(usd: number, ngnPerUsdc: number): number {
+  if (!Number.isFinite(usd) || usd < 0) {
+    throw new TypeError(`usdToNgn: usd must be a non-negative finite number, got ${usd}`);
+  }
+  if (!Number.isFinite(ngnPerUsdc) || ngnPerUsdc <= 0) {
+    throw new TypeError(`usdToNgn: ngnPerUsdc must be a positive finite number, got ${ngnPerUsdc}`);
+  }
+
+  // ngn_kobo_exact = usd * ngnPerUsdc * 100
+  // Apply ceiling:  = ceil(usd * ngnPerUsdc * 100)
+  // Use bigint to avoid floating-point drift on the multiplication.
+  const usdMicro = BigInt(Math.round(usd * 1_000_000));
+  const rateKobo = BigInt(Math.round(ngnPerUsdc * 100));
+  const numerator = usdMicro * rateKobo;
+  const denominator = 1_000_000n;
+  // Ceiling division: (a + b - 1) / b
+  const ngnKoboCeil = (numerator + denominator - 1n) / denominator;
+  return Number(ngnKoboCeil) / 100;
+}
+
+/**
+ * Converts an NGN amount to USD using a live exchange rate expressed as
+ * NGN-per-USDC (USD is treated 1:1 with USDC for display purposes).
+ *
+ * Rounding: **floor** to 2 decimal places — the displayed USD never exceeds
+ * the NGN amount the user entered.
+ *
+ * @param ngn        - Amount in NGN (may be fractional).
+ * @param ngnPerUsdc - Live exchange rate: how many NGN equal 1 USD.
+ * @returns USD amount (float, floored to 2 decimal places).
+ *
+ * @example
+ * // 1 USD = 1500 NGN:
+ * ngnToUsd(1500, 1500) // 1
+ * ngnToUsd(750,  1500) // 0.5
+ * ngnToUsd(1,    1500) // 0  (floor of 0.000666…)
+ */
+export function ngnToUsd(ngn: number, ngnPerUsdc: number): number {
+  if (!Number.isFinite(ngn) || ngn < 0) {
+    throw new TypeError(`ngnToUsd: ngn must be a non-negative finite number, got ${ngn}`);
+  }
+  if (!Number.isFinite(ngnPerUsdc) || ngnPerUsdc <= 0) {
+    throw new TypeError(`ngnToUsd: ngnPerUsdc must be a positive finite number, got ${ngnPerUsdc}`);
+  }
+
+  // usd_cents_exact = ngn / ngnPerUsdc * 100
+  // Apply floor:    = floor(ngnKobo * 100 / ngnPerUsdcKobo)
+  //   where ngnKobo        = ngn * 100  (integer)
+  //         ngnPerUsdcKobo = ngnPerUsdc * 100
+  // The 100s cancel so this simplifies to:
+  //   usd_cents = floor( ngnKobo / ngnPerUsdcKobo )
+  const ngnKobo = BigInt(Math.round(ngn * 100));
+  const rateKobo = BigInt(Math.round(ngnPerUsdc * 100));
+  const usdCents = ngnKobo / rateKobo; // bigint division truncates (floor)
+  return Number(usdCents) / 100;
+}
+
+/**
+ * Formats an exchange-rate fetch timestamp as a human-readable freshness label.
+ *
+ * @param fetchedAt - ISO-8601 timestamp of when the rate was fetched.
+ * @returns A string of the form `"Rate as of HH:MM"`.
+ *
+ * @example
+ * formatRateTimestamp("2024-01-01T14:05:00Z") // "Rate as of 14:05"
+ */
+export function formatRateTimestamp(fetchedAt: string): string {
+  const date = new Date(fetchedAt);
+  if (Number.isNaN(date.getTime())) {
+    throw new TypeError(`formatRateTimestamp: invalid timestamp, got ${fetchedAt}`);
+  }
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `Rate as of ${hours}:${minutes}`;
 }

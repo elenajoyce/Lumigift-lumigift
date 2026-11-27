@@ -3,10 +3,18 @@ import { GIFT_THEME_IDS } from "@/lib/giftThemes";
 import { normalizePhone } from "@/lib/phone";
 import { formatNGN } from "@/lib/currency";
 
+/**
+ * Validates and normalises any E.164 phone number (+[country code][number]).
+ * Nigerian local formats (08xx, 234xx) are also accepted.
+ * Updated for issue #469: broadened from Nigerian-only to international E.164.
+ */
 const e164Phone = z.string().transform((val, ctx) => {
   const normalized = normalizePhone(val);
   if (!normalized) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Enter a valid phone number" });
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Enter a valid phone number in E.164 format (e.g. +2348012345678)",
+    });
     return z.NEVER;
   }
   return normalized;
@@ -37,6 +45,8 @@ export const createGiftSchema = z.strictObject({
     .datetime()
     .refine((val) => new Date(val) > new Date(), "Unlock date must be in the future"),
   paymentProvider: z.enum(["paystack", "stripe"]),
+  /** Only used for Stripe; Paystack is always NGN. Defaults to USD for Stripe. */
+  currency: z.enum(["usd", "gbp", "eur"]).optional(),
   recipientIsRegistered: z.boolean().default(false),
   recipientEmail: z.string().email("Enter a valid email address").optional(),
   themeId: z.enum(GIFT_THEME_IDS).optional(),

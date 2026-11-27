@@ -7,6 +7,8 @@ import {
 } from "@/lib/metrics";
 import type { ApiResponse } from "@/types";
 import { isAuthorizedCronRequest } from "@/server/cron-auth";
+import { withErrorHandler } from "@/server/middleware";
+import { requestLogger, getCorrelationId } from "@/lib/logger";
 
 /**
  * GET /api/v1/cron/expire
@@ -30,8 +32,11 @@ async function pingHealthcheck(suffix = "") {
   }
 }
 
-export const GET = async (req: NextRequest) => {
+// Wrapped with `withErrorHandler` so every response carries a
+// request/correlation ID and is logged against it (#509).
+export const GET = withErrorHandler(async (req: NextRequest) => {
   const authHeader = req.headers.get("authorization");
+  const log = requestLogger(getCorrelationId(req.headers));
   if (!isAuthorizedCronRequest(authHeader)) {
     return NextResponse.json<ApiResponse<never>>(
       { success: false, error: "Unauthorized" },
@@ -40,15 +45,15 @@ export const GET = async (req: NextRequest) => {
   }
 
   const startedAt = new Date();
-  console.log("[cron/expire] run started", { startedAt });
+  log.info({ startedAt }, "[cron/expire] run started");
 
   try {
     await processExpiries();
     const durationMs = Date.now() - startedAt.getTime();
 
-    console.log("[cron/expire] run complete", { durationMs });
+    log.info({ durationMs }, "[cron/expire] run complete");
 
-    await pingHealthcheck(); // success ping
+    await pingHealthcheck("expire"); // success ping
 
     return NextResponse.json<ApiResponse<{ message: string; durationMs: number }>>({
       success: true,
@@ -56,13 +61,13 @@ export const GET = async (req: NextRequest) => {
     });
   } catch (err) {
     const durationMs = Date.now() - startedAt.getTime();
-    console.error("[cron/expire] run failed", { startedAt, error: err });
+    log.error({ startedAt, err }, "[cron/expire] run failed");
     recordCronFailure("cron/v1/expire", durationMs, err);
     await recordDeadLetter("cron/v1/expire", durationMs, err);
-    await pingHealthcheck("/fail"); // failure ping
+    await pingHealthcheck("expire", "/fail"); // failure ping
     return NextResponse.json<ApiResponse<never>>(
       { success: false, error: "Expiry job failed" },
       { status: 500 }
     );
   }
-};
+});

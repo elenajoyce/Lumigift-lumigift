@@ -21,6 +21,9 @@ import {
   sendOtp,
   sendNewDeviceAlert,
   sendGiftInvitation,
+  sendGiftClaimedAlert,
+  sendGiftFundedAlert,
+  sendAccountDeletionAlert,
 } from "@/lib/sms";
 
 // ─── Email adapter imports ────────────────────────────────────────────────────
@@ -28,6 +31,8 @@ import {
   sendGiftReceivedEmail,
   sendUnlockReminderEmail,
   sendClaimConfirmationEmail,
+  sendAccountDeletionEmail,
+  sendDataExportReadyEmail,
   type GiftEmailData,
 } from "@/lib/email";
 
@@ -76,10 +81,32 @@ export type SmsGiftInvitationPayload = {
   senderName: string;
 };
 
+export type SmsGiftClaimedPayload = {
+  type: "gift_claimed";
+  phone: string;
+  recipientName: string;
+  amountUsdc: string;
+};
+
+export type SmsGiftFundedPayload = {
+  type: "gift_funded";
+  phone: string;
+  amountUsdc: string;
+};
+
+export type SmsAccountDeletionScheduledPayload = {
+  type: "account_deletion_scheduled";
+  phone: string;
+  cancelUrl: string;
+};
+
 export type SmsPayload =
   | SmsOtpPayload
   | SmsNewDeviceAlertPayload
-  | SmsGiftInvitationPayload;
+  | SmsGiftInvitationPayload
+  | SmsGiftClaimedPayload
+  | SmsGiftFundedPayload
+  | SmsAccountDeletionScheduledPayload;
 
 // Email payload variants
 export type EmailGiftReceivedPayload = {
@@ -100,10 +127,24 @@ export type EmailClaimConfirmationPayload = {
   data: GiftEmailData;
 };
 
+export type EmailAccountDeletionScheduledPayload = {
+  type: "account_deletion_scheduled";
+  to: string;
+  cancelUrl: string;
+};
+
+export type EmailDataExportReadyPayload = {
+  type: "data_export_ready";
+  to: string;
+  downloadUrl: string;
+};
+
 export type EmailPayload =
   | EmailGiftReceivedPayload
   | EmailUnlockReminderPayload
-  | EmailClaimConfirmationPayload;
+  | EmailClaimConfirmationPayload
+  | EmailAccountDeletionScheduledPayload
+  | EmailDataExportReadyPayload;
 
 /**
  * Union of all notification payloads.
@@ -190,6 +231,18 @@ async function dispatchSms(payload: SmsPayload): Promise<string | undefined> {
       await sendGiftInvitation(payload.phone, payload.invitationToken, payload.senderName);
       return undefined;
     }
+    case "gift_claimed": {
+      await sendGiftClaimedAlert(payload.phone, payload.recipientName, payload.amountUsdc);
+      return undefined;
+    }
+    case "gift_funded": {
+      await sendGiftFundedAlert(payload.phone, payload.amountUsdc);
+      return undefined;
+    }
+    case "account_deletion_scheduled": {
+      await sendAccountDeletionAlert(payload.phone, payload.cancelUrl);
+      return undefined;
+    }
     default: {
       // Exhaustive check — TypeScript will catch unhandled variants at compile time
       const _exhaustive: never = payload;
@@ -213,6 +266,12 @@ async function dispatchEmail(payload: EmailPayload): Promise<void> {
       return;
     case "claim_confirmation":
       await sendClaimConfirmationEmail(payload.to, payload.data);
+      return;
+    case "account_deletion_scheduled":
+      await sendAccountDeletionEmail(payload.to, payload.cancelUrl);
+      return;
+    case "data_export_ready":
+      await sendDataExportReadyEmail(payload.to, payload.downloadUrl);
       return;
     default: {
       const _exhaustive: never = payload;

@@ -25,7 +25,11 @@ export const POST = withErrorHandler(
   withCsrf(async (req: NextRequest) => {
     const validation = await validateBody(req, sendOtpSchema);
     if (!validation.success) return validation.response;
-    const { phone } = validation.data;
+    const { phone: rawPhone } = validation.data;
+    // Normalize before using as a rate-limit key / sending — otherwise the
+    // per-phone limit is trivially bypassed by varying formatting
+    // (+234..., 0..., with spaces/dashes) for the same underlying number.
+    const phone = normalizePhone(rawPhone);
 
       const ip = req.headers.get("x-forwarded-for")?.split(",")[0].trim() ?? "unknown";
 

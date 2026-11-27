@@ -1,132 +1,121 @@
-/**
- * Webhook signature verification — HMAC-SHA256 with replay protection.
- *
- * Implements the same security model used by Stripe and GitHub webhooks:
- *   1. The sender computes HMAC-SHA256(secret, timestamp + "." + body)
- *   2. The signature is sent in the `X-Lumigift-Signature` header as
- *      "sha256=<hex-digest>"
- *   3. The timestamp is sent in the `X-Lumigift-Timestamp` header as a
- *      Unix epoch in seconds
- *   4. We recompute the expected signature and do a **timing-safe** comparison
- *   5. We reject events whose timestamp is more than REPLAY_WINDOW_SECONDS old
- *
- * Usage:
- *   import { verifyWebhookSignature } from "@/lib/webhook-verify";
- *
- *   const result = await verifyWebhookSignature(req, secret);
- *   if (!result.ok) {
- *     return NextResponse.json({ error: result.reason }, { status: 401 });
- *   }
- */
-
-import { createHmac, timingSafeEqual } from "crypto";
-
-/** Events older than this (seconds) are rejected to prevent replay attacks. */
-export const REPLAY_WINDOW_SECONDS = 5 * 60; // 5 minutes
-
-export type VerifyResult =
-  | { ok: true }
-  | { ok: false; reason: string };
+import crypto from 'crypto';
 
 /**
- * Verifies the HMAC-SHA256 signature on an incoming webhook request.
- *
- * @param req     - The incoming NextRequest (body read as text)
- * @param secret  - The shared secret (at least 32 characters recommended)
- * @returns       - `{ ok: true }` on success or `{ ok: false, reason }` on failure
+ * Result of a webhook signature verification.
  */
-export async function verifyWebhookSignature(
-  req: Request,
-  secret: string
-): Promise<{ ok: true; rawBody: string } | { ok: false; reason: string }> {
-  // ── 1. Extract headers ─────────────────────────────────────────────────────
-  const signatureHeader = req.headers.get("x-lumigift-signature");
-  const timestampHeader = req.headers.get("x-lumigift-timestamp");
+export type WebhookVerifyResult =
+  | { valid: true }
+  | { valid: false; reason: 'missing_signature' | 'invalid_signature' | 'missing_secret' | 'error' };
 
-  if (!signatureHeader) {
-    return { ok: false, reason: "Missing X-Lumigift-Signature header" };
-  }
-  if (!timestampHeader) {
-    return { ok: false, reason: "Missing X-Lumigift-Timestamp header" };
-  }
-
-  // ── 2. Validate and parse timestamp ────────────────────────────────────────
-  const timestamp = parseInt(timestampHeader, 10);
-  if (!Number.isInteger(timestamp) || timestamp <= 0) {
-    return { ok: false, reason: "Invalid X-Lumigift-Timestamp value" };
-  }
-
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  const ageSeconds = nowSeconds - timestamp;
-
-  if (ageSeconds > REPLAY_WINDOW_SECONDS) {
-    return {
-      ok: false,
-      reason: `Webhook event too old (age: ${ageSeconds}s, window: ${REPLAY_WINDOW_SECONDS}s)`,
-    };
+/**
+ * Verify a Paystack webhook signature.
+ *
+ * Paystack signs the raw request body with HMAC-SHA512 using the secret key
+ * and sends the hex digest in the `x-paystack-signature` header.
+ *
+ * @param rawBody        The raw request body (string or Buffer). Must be the
+ *                       exact bytes Paystack signed, before JSON parsing.
+ * @param signatureHeader The value of the `x-paystack-signature` header.
+ * @param secret         The Paystack secret key (from serverConfig).
+ */
+export function verifyPaystackSignature(
+  rawBody: string | Buffer,
+  signatureHeader: string | undefined | null,
+  secret: string | undefined | null,
+): WebhookVerifyResult {
+  if (!signatureHeader || typeof signatureHeader !== 'string' || signatureHeader.trim() === '') {
+    return { valid: false, reason: 'missing_signature' };
   }
 
-  if (ageSeconds < -30) {
-    // Allow 30 seconds of clock skew in the other direction
-    return { ok: false, reason: "Webhook timestamp is too far in the future" };
+  if (!secret || typeof secret !== 'string' || secret.trim() === '') {
+    return { valid: false, reason: 'missing_secret' };
   }
 
-  // ── 3. Extract and validate signature format ───────────────────────────────
-  if (!signatureHeader.startsWith("sha256=")) {
-    return { ok: false, reason: "Signature must use sha256= prefix" };
-  }
-  const receivedSig = signatureHeader.slice(7); // strip "sha256="
-
-  // ── 4. Read raw body (must not be parsed before this point) ───────────────
-  let rawBody: string;
   try {
-    rawBody = await req.text();
+    const bodyBuffer = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody ?? '', 'utf8');
+    const expected = crypto.createHmac('sha512', secret).update(bodyBuffer).digest('hex');
+
+    const provided = signatureHeader.trim().toLowerCase();
+    const expectedBuf = Buffer.from(expected, 'utf8');
+    const providedBuf = Buffer.from(provided, 'utf8');
+
+    // Length check is required before timingSafeEqual to avoid throwing.
+    if (expectedBuf.length !== providedBuf.length) {
+      return { valid: false, reason: 'invalid_signature' };
+    }
+
+    const match = crypto.timingSafeEqual(expectedBuf, providedBuf);
+    return match ? { valid: true } : { valid: false, reason: 'invalid_signature' };
   } catch {
-    return { ok: false, reason: "Failed to read request body" };
+    return { valid: false, reason: 'error' };
   }
-
-  // ── 5. Compute expected signature ─────────────────────────────────────────
-  // Signed payload: "<timestamp>.<raw_body>"
-  const signedPayload = `${timestamp}.${rawBody}`;
-  const expectedSig = createHmac("sha256", secret)
-    .update(signedPayload, "utf8")
-    .digest("hex");
-
-  // ── 6. Timing-safe comparison ─────────────────────────────────────────────
-  let signaturesMatch: boolean;
-  try {
-    signaturesMatch = timingSafeEqual(
-      Buffer.from(receivedSig, "hex"),
-      Buffer.from(expectedSig, "hex")
-    );
-  } catch {
-    // Buffer lengths differ → definitely not equal
-    signaturesMatch = false;
-  }
-
-  if (!signaturesMatch) {
-    return { ok: false, reason: "Signature mismatch" };
-  }
-
-  return { ok: true, rawBody };
 }
 
 /**
- * Generates the HMAC-SHA256 signature for a given payload.
- * Useful for testing and for the sender side (e.g. integration tests).
+ * Verify a Stripe-style webhook signature.
  *
- * @param secret    - The shared secret
- * @param body      - The raw request body string
- * @param timestamp - Unix epoch in seconds (defaults to now)
+ * Stripe sends a header of the form `t=<timestamp>,v1=<signature>` and signs
+ * the string `${timestamp}.${rawBody}` with HMAC-SHA256.
+ *
+ * @param rawBody         The raw request body (string or Buffer).
+ * @param signatureHeader The value of the `stripe-signature` header.
+ * @param secret          The Stripe webhook signing secret.
+ * @param toleranceSec    Max allowed age of the timestamp (default 300s).
  */
-export function signWebhookPayload(
-  secret: string,
-  body: string,
-  timestamp: number = Math.floor(Date.now() / 1000)
-): { signature: string; timestamp: number } {
-  const signedPayload = `${timestamp}.${body}`;
-  const signature = createHmac("sha256", secret)
-    .update(signedPayload, "utf8")
-    .digest("hex");
-  return { signature: `sha256=${signature}`, timestamp };
+export function verifyStripeSignature(
+  rawBody: string | Buffer,
+  signatureHeader: string | undefined | null,
+  secret: string | undefined | null,
+  toleranceSec = 300,
+): WebhookVerifyResult {
+  if (!signatureHeader || typeof signatureHeader !== 'string' || signatureHeader.trim() === '') {
+    return { valid: false, reason: 'missing_signature' };
+  }
+
+  if (!secret || typeof secret !== 'string' || secret.trim() === '') {
+    return { valid: false, reason: 'missing_secret' };
+  }
+
+  try {
+    const parts = signatureHeader.split(',').reduce<Record<string, string>>((acc, part) => {
+      const [key, value] = part.split('=');
+      if (key && value) {
+        acc[key.trim()] = value.trim();
+      }
+      return acc;
+    }, {});
+
+    const timestamp = parts['t'];
+    const providedSig = parts['v1'];
+
+    if (!timestamp || !providedSig) {
+      return { valid: false, reason: 'invalid_signature' };
+    }
+
+    const timestampNum = Number(timestamp);
+    if (!Number.isFinite(timestampNum)) {
+      return { valid: false, reason: 'invalid_signature' };
+    }
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (Math.abs(nowSec - timestampNum) > toleranceSec) {
+      return { valid: false, reason: 'invalid_signature' };
+    }
+
+    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : String(rawBody ?? '');
+    const payload = `${timestamp}.${bodyString}`;
+    const expected = crypto.createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
+
+    const expectedBuf = Buffer.from(expected, 'utf8');
+    const providedBuf = Buffer.from(providedSig.toLowerCase(), 'utf8');
+
+    if (expectedBuf.length !== providedBuf.length) {
+      return { valid: false, reason: 'invalid_signature' };
+    }
+
+    const match = crypto.timingSafeEqual(expectedBuf, providedBuf);
+    return match ? { valid: true } : { valid: false, reason: 'invalid_signature' };
+  } catch {
+    return { valid: false, reason: 'error' };
+  }
 }

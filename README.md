@@ -9,6 +9,10 @@
 [![Built on Stellar](https://img.shields.io/badge/Built%20on-Stellar-blue)](https://stellar.org)
 [![Soroban](https://img.shields.io/badge/Smart%20Contracts-Soroban-blueviolet)](https://developers.stellar.org/docs/build/smart-contracts)
 [![Status](https://img.shields.io/badge/status-page-green)](https://status.lumigift.app)
+[![Storybook](https://img.shields.io/badge/Storybook-live-ff4785)](https://joekeyz8.github.io/Lumigift-lumigift/)
+=======
+
+> **Service Status:** Check real-time uptime and incident history at [status.lumigift.app](https://status.lumigift.app)
 
 ---
 
@@ -96,6 +100,8 @@ scripts/
 ---
 
 ## Getting Started
+
+> **New contributor?** Start with the [Contributor Onboarding Guide](CONTRIBUTING.md) — it covers repo setup, environment variables, Docker dev setup, running tests, the architecture, and your first PR workflow.
 
 ### Prerequisites
 
@@ -197,7 +203,21 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000).
 
+### API Reference
+
+Interactive API documentation is generated from the OpenAPI spec
+(`openapi.yaml`) and served by Swagger UI at
+[http://localhost:3000/api/docs](http://localhost:3000/api/docs) in
+development and staging. The same spec is published as a static Redoc
+artifact by CI (`openapi-validate.yml`), which also validates the spec on
+every pull request.
+
+- **Swagger UI (dev/staging):** `/api/docs`
+- **OpenAPI spec:** [`openapi.yaml`](openapi.yaml)
+- **Static Redoc artifact:** downloaded from the `openapi-validate` workflow run
+
 ### Storybook (isolated component development)
+=======
 
 Lumigift uses [Storybook](https://storybook.js.org/) to develop and review UI
 components in isolation. Stories exist for `Button`, `Input`, `Badge`,
@@ -214,9 +234,20 @@ npm run storybook
 npm run storybook:build
 ```
 
-The static build output is written to `storybook-static/`. Chromatic visual
-diffing can be enabled by adding the `chromatic` addon and a `CHROMATIC_TOKEN`
-secret to CI.
+The static build output is written to `storybook-static/`.
+
+### Published Storybook
+
+The component library is published automatically on every merge to `main`:
+
+- **Live site:** https://joekeyz8.github.io/Lumigift-lumigift/
+- **Build:** `npm run storybook:build` → deployed to GitHub Pages by the
+  `storybook` CI workflow
+- **Visual regression:** every PR runs a Chromatic build that diffs each story
+  against the `main` baseline and posts the result as a PR status check.
+  Add the `CHROMATIC_PROJECT_TOKEN` secret to enable it.
+
+All component stories must pass in the CI build before a PR can merge.
 
 ---
 
@@ -248,7 +279,16 @@ STELLAR_NETWORK=testnet npm run contract:deploy
 ## Mutation Testing
 
 Lumigift uses [Stryker Mutator](https://stryker-mutator.io) to verify test suite quality.
-A **minimum mutation score of 70%** is required to merge PRs — the CI job will fail and post a score comment if the threshold is not met.
+A **minimum mutation score of 80% per file** is required for the core services — the CI job will fail and post a score comment if any targeted file falls below the threshold.
+
+### Targeted files
+
+| File                                        | Minimum score |
+| ------------------------------------------- | ------------- |
+| `src/server/services/gift.service.ts`       | 80%           |
+| `src/server/services/claim.service.ts`      | 80%           |
+| `src/lib/gift-state-machine.ts`             | 80%           |
+| `src/server/services/exchange-rate.service.ts` | 80%        |
 
 ### Running locally
 
@@ -256,8 +296,8 @@ A **minimum mutation score of 70%** is required to merge PRs — the CI job will
 # Full mutation test run (slow — ~10 min on first run)
 npx stryker run
 
-# Target high-priority modules only (faster iteration)
-npx stryker run --mutate "src/server/services/gift.service.ts,src/lib/escrow-client.ts"
+# Target the core services only (faster iteration)
+npx stryker run --mutate "src/server/services/gift.service.ts,src/server/services/claim.service.ts,src/lib/gift-state-machine.ts,src/server/services/exchange-rate.service.ts"
 ```
 
 ### Configuration
@@ -266,22 +306,60 @@ See `stryker.config.js`. Key settings:
 
 | Option              | Value                                 |
 | ------------------- | ------------------------------------- |
-| `thresholds.break`  | `70` — CI fails below this score      |
-| `thresholds.low`    | `70` — score is highlighted in red    |
-| `thresholds.high`   | `80` — score is highlighted in green  |
-| High-priority files | `gift.service.ts`, `escrow-client.ts` |
+| `thresholds.break`  | `80` — CI fails below this score      |
+| `thresholds.low`    | `80` — score is highlighted in red    |
+| `thresholds.high`   | `90` — score is highlighted in green  |
+| Targeted files      | the four core services listed above   |
 
-HTML reports are saved to `reports/mutation/` and uploaded as CI artifacts.
+HTML reports are saved to `reports/mutation/` and uploaded as CI artifacts
+(`mutation-report`), including the killed-mutant count per file. Any surviving
+mutants are documented in the PR description with a rationale, or covered by
+new tests.
+
+---
+
+## Status & Uptime Monitoring
+
+Lumigift's uptime is monitored externally via the `/api/health/ready` endpoint (checked every minute). Incidents are escalated to the on-call engineer within 2 minutes.
+
+- **Public status page:** [https://status.lumigift.app](https://status.lumigift.app)
+- **Health endpoint:** `/api/health/ready`
+
+Subscribe on the status page to receive incident notifications.
+
+---
+
+## Documentation
+
+- **Local development setup** — [docs/local-dev-setup.md](docs/local-dev-setup.md), including the [Windows/WSL2 guide](docs/local-dev-setup.md#windows--wsl2-setup)
+- **Incident response playbook** — [docs/ops/incident-response.md](docs/ops/incident-response.md)
+- **Privacy & data retention** — [docs/privacy-data-retention.md](docs/privacy-data-retention.md), including the [NDPR subject access request (SAR) procedure](docs/privacy-data-retention.md#subject-access-request-sar-process)
+- **Architecture decision records** — [docs/adr/README.md](docs/adr/README.md)
+
+---
+
+## API Documentation
+
+Auto-generated API reference docs are published to GitHub Pages on every push to `main`:
+
+**📚 [https://joekeyz8.github.io/Lumigift-lumigift/](https://joekeyz8.github.io/Lumigift-lumigift/)**
+
+The docs are generated with [TypeDoc](https://typedoc.org/) from `src/lib` and `src/server/services` (app routes are excluded). To regenerate them locally:
+
+```bash
+npx typedoc
+```
 
 ---
 
 ## Contributing
 
-We welcome contributions! Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR.
+We welcome contributions! Please read the [Contributor Onboarding Guide](CONTRIBUTING.md) before opening a PR — it walks you through setup, architecture, testing, and the first-contribution workflow.
 
 - Bug reports → [Bug Report template](.github/ISSUE_TEMPLATE/bug_report.md)
 - Feature requests → [Feature Request template](.github/ISSUE_TEMPLATE/feature_request.md)
 - Security issues → **security@lumigift.com** (do not open public issues)
+- Windows/WSL2 contributors → see the [WSL2 setup guide](docs/local-dev-setup.md#windows--wsl2-setup)
 
 ---
 

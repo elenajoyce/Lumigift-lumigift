@@ -29,6 +29,22 @@ const config = [
   ...patchedNextFlat,
   // Project-specific overrides
   {
+    // Issue #498: flag inline `style` props on components in favour of CSS modules.
+    // (react/* rules are stripped above, so use no-restricted-syntax instead of
+    // react/forbid-component-props.)
+    files: ["src/components/**/*.{js,jsx,ts,tsx}"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: "JSXAttribute[name.name='style']",
+          message:
+            "Inline `style` props are not allowed in src/components. Move the styles to the component's *.module.css file (see issue #498).",
+        },
+      ],
+    },
+  },
+  {
     rules: {
       "no-console": ["warn", { allow: ["warn", "error"] }],
       "no-unused-vars": ["error", { argsIgnorePattern: "^_" }],

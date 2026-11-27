@@ -33,7 +33,10 @@ export interface AdminGiftQuery {
   search?: string; // matches recipientName (case-insensitive)
   status?: GiftStatus;
   cursor?: string;
-  limit?: number;
+  /** 1-based page number; used for display only (pagination is cursor-based). */
+  page?: number;
+  /** Number of gifts per page; defaults to DEFAULT_PAGE_SIZE and is capped at MAX_PAGE_SIZE. */
+  pageSize?: number;
   /** When true, includes soft-deleted gifts; when false (default) excludes them. */
   includeDeleted?: boolean;
 }
@@ -47,8 +50,8 @@ export interface AdminGiftPage {
   pageSize: number;
 }
 
-const DEFAULT_PAGE_SIZE = 25;
-const MAX_PAGE_SIZE = 100;
+export const DEFAULT_PAGE_SIZE = 25;
+export const MAX_PAGE_SIZE = 100;
 
 /**
  * Lists admin-visible gifts with status/date filtering and cursor-based
@@ -108,8 +111,9 @@ export function adminListGifts(query: AdminGiftQuery): AdminGiftPage {
   const pageGifts = all.slice(startIndex, startIndex + pageSize);
   const lastInPage = pageGifts[pageGifts.length - 1];
 
-  const nextCursor =
-    startIndex + pageSize < total ? (lastInPage?.id ?? null) : null;
+  // Next cursor: only present when there are more items beyond this page.
+  const hasMore = startIndex + pageGifts.length < total;
+  const nextCursor = hasMore ? (lastInPage?.id ?? null) : null;
 
   // Prev cursor: the first id of the previous page (the item just before the
   // current page start when paging backwards).

@@ -2,12 +2,15 @@
  * @jest-environment jsdom
  *
  * Automated screen-reader focus-order tests for the Dialog component.
- * Covers acceptance criteria for issue #35.
+ * Covers acceptance criteria for issue #35, #467.
  */
 
 import React, { createRef } from "react";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { axe, toHaveNoViolations } from "jest-axe";
 import { Dialog } from "../Dialog";
+
+expect.extend(toHaveNoViolations);
 
 describe("Dialog – accessible focus management", () => {
   function TestDialog({
@@ -99,5 +102,11 @@ describe("Dialog – accessible focus management", () => {
     expect(backdrop).toBeTruthy();
     fireEvent.click(backdrop);
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("has no axe-core violations", async () => {
+    const { container } = render(<TestDialog />);
+    const results = await axe(container);
+    expect(results).toHaveNoViolations();
   });
 });

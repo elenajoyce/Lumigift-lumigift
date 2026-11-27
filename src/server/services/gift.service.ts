@@ -13,6 +13,12 @@ import { createAuditLog } from "./audit.service";
 import { sendGiftReceivedEmail } from "@/lib/email";
 import type { GiftCursorPosition } from "./gift-cursor";
 import { incrementFunnelCounter, recordFunnelTransition } from "@/lib/metrics";
+import {
+  findGiftById,
+  findGiftsBySender,
+  findGiftsByRecipientHash,
+  transitionGiftStatus,
+} from "./gift.db";
 
 let _stripe: Stripe | null = null;
 function getStripe(): Stripe {
@@ -26,6 +32,28 @@ function getStripe(): Stripe {
 
 // ─── Exchange rate helper ─────────────────────────────────────────────────────
 import { getExchangeRate, lockExchangeRate } from "@/server/services/exchange-rate.service";
+import { recordPaymentCurrency } from "./gift.db";
+
+/**
+ * Approximate USD cross-rates used to convert the live NGN/USD rate into
+ * GBP/EUR for Stripe. These are refreshed independently of the NGN/USDC feed
+ * since Stripe settles in the destination currency, not USDC. Issue #527.
+ */
+const USD_CROSS_RATES: Record<"gbp" | "eur", number> = { gbp: 0.78, eur: 0.92 };
+
+/**
+ * Converts an NGN amount into Stripe's minor units for `currency`, locking
+ * the rate at order creation time so later FX moves don't affect this charge.
+ */
+async function lockStripeAmount(
+  amountNgn: number,
+  currency: "usd" | "gbp" | "eur"
+): Promise<number> {
+  const { ngnPerUsdc } = await getExchangeRate(); // USDC ≈ USD peg
+  const usd = amountNgn / ngnPerUsdc;
+  const major = currency === "usd" ? usd : usd * USD_CROSS_RATES[currency];
+  return Math.round(major * 100);
+}
 
 /**
  * Converts a Nigerian Naira amount to its USDC equivalent using the live
@@ -39,18 +67,47 @@ export async function ngnToUsdc(ngn: number): Promise<string> {
   return (ngn / ngnPerUsdc).toFixed(7);
 }
 
+/**
+ * Thrown when a gift with the same sender, recipient, and amount already
+ * exists in a non-terminal state. Prevents accidental duplicate submissions
+ * (e.g. double-clicking the "Send gift" button).
+ */
+export class DuplicateGiftError extends Error {
+  constructor(public readonly existingGiftId: string) {
+    super("A matching gift is already in progress");
+    this.name = "DuplicateGiftError";
+  }
+}
+
+/**
+ * Returns an existing non-terminal gift matching the sender/recipient/amount
+ * tuple, or `null` if none exists. Used for duplicate-gift prevention.
+ */
+function findDuplicateGift(
+  senderId: string,
+  recipientPhoneHash: string,
+  amountNgn: number
+): Gift | null {
+  const nonTerminal: GiftStatus[] = ["pending_payment", "funded", "locked", "unlocked"];
+  for (const gift of gifts.values()) {
+    if (
+      !gift.deletedAt &&
+      gift.senderId === senderId &&
+      gift.recipientPhoneHash === recipientPhoneHash &&
+      gift.amountNgn === amountNgn &&
+      nonTerminal.includes(gift.status)
+    ) {
+      return gift;
+    }
+  }
+  return null;
+}
+
 /** Hash a phone number for storage. Plaintext is never persisted. */
 export function hashPhone(phone: string): string {
   return createHash("sha256").update(phone).digest("hex");
 }
 
-// ─── In-memory store (replace with DB in production) ─────────────────────────
-export const gifts = new Map<string, Gift>();
-
-/** Returns only non-deleted (active) gifts from the store. */
-function activeGifts(): Gift[] {
-  return [...gifts.values()].filter((g) => !g.deletedAt);
-}
 
 /**
  * Creates a new gift record and initializes a Paystack payment session.
@@ -77,16 +134,29 @@ export async function createGift(
   const { dailyLimitNgn } = serverConfig.giftLimits;
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
-  const todayTotal = activeGifts()
-    .filter((g) => g.senderId === senderId && g.createdAt >= todayStart)
-    .reduce((sum, g) => sum + g.amountNgn, 0);
+  const { rows: dailyRows } = await pool.query<{ total: string | null }>(
+    `SELECT COALESCE(SUM(amount_ngn), 0)::text AS total
+       FROM gifts
+      WHERE sender_id = $1
+        AND deleted_at IS NULL
+        AND created_at >= $2`,
+    [senderId, todayStart]
+  );
+  const todayTotal = Number(dailyRows[0]?.total ?? 0);
   if (todayTotal + input.amountNgn > dailyLimitNgn) {
     throw new Error(`Daily sending limit of ${formatNGN(dailyLimitNgn)} exceeded`);
   }
 
+  const recipientPhoneHash = hashPhone(input.recipientPhone);
+
+  // ── Duplicate gift prevention ──────────────────────────────────────────────
+  const duplicate = findDuplicateGift(senderId, recipientPhoneHash, input.amountNgn);
+  if (duplicate) {
+    throw new DuplicateGiftError(duplicate.id);
+  }
+
   const id = randomUUID();
   const amountUsdc = await ngnToUsdc(input.amountNgn);
-  const recipientPhoneHash = hashPhone(input.recipientPhone);
   const paymentReference = `lumigift_${id}`;
 
   // Sanitize message content to prevent stored XSS
@@ -112,9 +182,6 @@ export async function createGift(
     paymentReference,
   });
 
-  // Mirror to in-memory Map for backward-compat with callers that still read
-  // from the Map (will be fully removed once all queries go through gift.db.ts)
-  gifts.set(id, gift);
   incrementFunnelCounter("gifts_created");
 
   // Lock the exchange rate for slippage protection (expires in 5 minutes)
@@ -176,25 +243,37 @@ export async function createGift(
   // International payments use Stripe embedded Payment Element — return the
   // PaymentIntent client secret instead of a hosted checkout URL.
   if (input.paymentProvider === "stripe") {
+    const stripeCurrency = input.currency ?? "usd";
+    const stripeAmountMinor = await lockStripeAmount(input.amountNgn, stripeCurrency);
     const intent = await getStripe().paymentIntents.create(
       {
-        amount: Math.round(Number(amountUsdc) * 100),
-        currency: "usd",
+        amount: stripeAmountMinor,
+        currency: stripeCurrency,
         automatic_payment_methods: { enabled: true },
-        metadata: { giftId: id, senderId, reference: paymentReference },
+        metadata: { giftId: id, senderId, reference: paymentReference, currency: stripeCurrency },
       },
       { idempotencyKey: paymentReference }
     );
+    await recordPaymentCurrency(id, stripeCurrency, stripeAmountMinor / 100);
     return { gift, paymentUrl: "", clientSecret: intent.client_secret ?? undefined };
   }
 
-  const payment = await initializePayment({
-    email: `${senderId}@lumigift.app`, // placeholder; use real email from user record
-    amountKobo: ngnToKobo(input.amountNgn),
-    reference: paymentReference,
-    callbackUrl: `${serverConfig.app.url}/api/payments/callback?giftId=${id}`,
-    metadata: { giftId: id, senderId },
-  });
+  let payment;
+  try {
+    payment = await initializePayment({
+      email: `${senderId}@lumigift.app`, // placeholder; use real email from user record
+      amountKobo: ngnToKobo(input.amountNgn),
+      reference: paymentReference,
+      callbackUrl: `${serverConfig.app.url}/api/payments/callback?giftId=${id}`,
+      metadata: { giftId: id, senderId },
+    });
+  } catch (err: unknown) {
+    // Paystack init failed after the gift row was persisted. The gift remains
+    // in `pending_payment` and can be retried; surface a clear error to the
+    // caller so the UI can prompt the user to try again.
+    console.error("[gift] initializePayment failed:", err);
+    throw new Error("Failed to initialize payment. Please try again.");
+  }
 
   return { gift, paymentUrl: payment.authorizationUrl };
 }
@@ -208,7 +287,7 @@ export async function createGift(
  * @returns The {@link Gift} if found and not soft-deleted, or `null`.
  */
 export async function getGiftById(id: string): Promise<Gift | null> {
-  const gift = gifts.get(id);
+  const gift = await findGiftById(id);
   if (!gift || gift.deletedAt) return null;
   return gift;
 }
@@ -222,13 +301,12 @@ export async function getGiftById(id: string): Promise<Gift | null> {
  * @throws If the transition from the current status to `status` is not allowed.
  */
 export async function updateGiftStatus(id: string, status: GiftStatus): Promise<Gift | null> {
-  const gift = gifts.get(id);
+  const existing = await findGiftById(id);
+  if (!existing) return null;
+  assertValidTransition(existing.status, status);
+  const previousStatus = existing.status;
+  const gift = await transitionGiftStatus(id, status);
   if (!gift) return null;
-  assertValidTransition(gift.status, status);
-  const previousStatus = gift.status;
-  gift.status = status;
-  gift.updatedAt = new Date();
-  gifts.set(id, gift);
   recordFunnelTransition(gift, previousStatus, status);
 
   // Publish the status change to Redis so SSE subscribers are notified in real
@@ -274,6 +352,69 @@ export async function updateGiftStatus(id: string, status: GiftStatus): Promise<
     });
   }
 
+  // ── Referral reward credit on first successful gift funding ────────────────
+  // When a referred user funds their first gift, credit the referrer with the
+  // env-configurable reward amount. The referral service marks the reward as
+  // `applied` idempotently and sends the referrer an email notification.
+  // Failures here must never break the gift status update — log and continue.
+  if (status === "funded") {
+    try {
+      await creditReferralOnFirstPayment(gift.senderId, id);
+    } catch (err: unknown) {
+      console.error("[gift.service] Referral reward credit failed:", err);
+    }
+  }
+
+  return gift;
+}
+
+/**
+ * Atomically transitions a gift from `fromStatus` to `toStatus`, guarding
+ * against double-claim race conditions (issue #510).
+ *
+ * The Redis-based `claim-guard` lock is only a first-line defence — if Redis
+ * is unavailable, multiple concurrent requests could otherwise all pass the
+ * `gift.status === "unlocked"` check before any of them writes "claimed".
+ * This function performs the compare-and-set as a single synchronous
+ * operation (no `await` between the read and the write), so it is atomic
+ * with respect to the Node.js event loop: the equivalent of
+ * `UPDATE gifts SET status = $toStatus WHERE id = $id AND status = $fromStatus`.
+ *
+ * @returns The updated {@link Gift} on success, or `null` if the gift does
+ *   not exist or its current status does not equal `fromStatus` (i.e. it was
+ *   already claimed/transitioned by a concurrent request — callers should
+ *   treat this as a 409 Conflict).
+ */
+export function atomicTransitionGiftStatus(
+  id: string,
+  fromStatus: GiftStatus,
+  toStatus: GiftStatus
+): Gift | null {
+  const gift = gifts.get(id);
+  if (!gift || gift.status !== fromStatus) return null;
+
+  // No `await` occurs between the check above and the write below, so this
+  // is safe against interleaving from other async callers.
+  const previousStatus = gift.status;
+  gift.status = toStatus;
+  gift.updatedAt = new Date();
+  gifts.set(id, gift);
+  recordFunnelTransition(gift, previousStatus, toStatus);
+
+  redis
+    .publish(
+      giftStatusChannel(id),
+      JSON.stringify({
+        giftId: id,
+        previousStatus,
+        status: toStatus,
+        updatedAt: gift.updatedAt.toISOString(),
+      })
+    )
+    .catch((err: unknown) => {
+      console.error("[gift.service] Redis publish failed for gift status change:", err);
+    });
+
   return gift;
 }
 
@@ -284,7 +425,7 @@ export async function updateGiftStatus(id: string, status: GiftStatus): Promise<
  * @returns An array of {@link Gift} objects, possibly empty.
  */
 export async function getGiftsBySender(senderId: string): Promise<Gift[]> {
-  return activeGifts().filter((g) => g.senderId === senderId);
+  return findGiftsBySender(senderId);
 }
 
 export interface GiftAnalyticsItem {
@@ -307,10 +448,8 @@ export interface GiftAnalytics {
 
 /** Returns sender-owned gift metrics and PII-free lifecycle details. */
 export async function getGiftAnalyticsBySender(senderId: string): Promise<GiftAnalytics> {
-  const sentGifts = [...gifts.values()].filter(
-    (gift) =>
-      gift.senderId === senderId &&
-      ["funded", "locked", "unlocked", "claimed", "expired"].includes(gift.status)
+  const sentGifts = (await findGiftsBySender(senderId)).filter((gift) =>
+    ["funded", "locked", "unlocked", "claimed", "expired"].includes(gift.status)
   );
   const claimedGifts = sentGifts.filter((gift) => gift.status === "claimed");
   const totalGiftsSent = sentGifts.length;
@@ -391,8 +530,8 @@ export async function getGiftsBySenderPaginated(
   filters?: GiftFilters
 ): Promise<GiftPageResult> {
   const snapshotAt = cursor ? new Date(cursor.snapshotAt) : new Date();
-  const all = [...gifts.values()]
-    .filter((g) => g.senderId === senderId && matchesFilters(g, filters))
+  const all = (await findGiftsBySender(senderId))
+    .filter((g) => matchesFilters(g, filters))
     .filter((g) => g.createdAt <= snapshotAt)
     .sort(
       (a, b) =>
@@ -441,8 +580,8 @@ export async function getGiftsBySenderPage(
 ): Promise<GiftPageOffset> {
   const safePage = Math.max(1, page);
   const safeLimit = Math.min(100, Math.max(1, limit));
-  const all = [...gifts.values()]
-    .filter((g) => g.senderId === senderId && matchesFilters(g, filters))
+  const all = (await findGiftsBySender(senderId))
+    .filter((g) => matchesFilters(g, filters))
     .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
 
   const offset = (safePage - 1) * safeLimit;
@@ -461,7 +600,7 @@ export async function getGiftsBySenderPage(
  */
 export async function getGiftsByRecipient(phone: string): Promise<Gift[]> {
   const hash = hashPhone(phone);
-  return activeGifts().filter((g) => g.recipientPhoneHash === hash);
+  return findGiftsByRecipientHash(hash);
 }
 
 /**
@@ -482,10 +621,14 @@ export async function cancelGift(
 ): Promise<Gift | null> {
   const gift = await updateGiftStatus(id, "cancelled");
   if (!gift) return null;
-  gift.cancelledAt = new Date();
-  gift.refundStatus = refundStatus;
-  gifts.set(id, gift);
-  return gift;
+  const { rows } = await pool.query<Gift>(
+    `UPDATE gifts
+        SET cancelled_at = NOW(), refund_status = $2, updated_at = NOW()
+      WHERE id = $1
+      RETURNING *`,
+    [id, refundStatus]
+  );
+  return rows[0] ?? null;
 }
 
 /**
@@ -502,12 +645,15 @@ export async function cancelGift(
  *   already soft-deleted.
  */
 export async function softDeleteGift(id: string, deletedBy: string): Promise<Gift | null> {
-  const gift = gifts.get(id);
-  if (!gift || gift.deletedAt) return null;
-
-  gift.deletedAt = new Date();
-  gift.updatedAt = new Date();
-  gifts.set(id, gift);
+  const { rows } = await pool.query<Gift>(
+    `UPDATE gifts
+        SET deleted_at = NOW(), updated_at = NOW()
+      WHERE id = $1 AND deleted_at IS NULL
+      RETURNING *`,
+    [id]
+  );
+  const gift = rows[0];
+  if (!gift) return null;
 
   // Audit log — required for financial compliance
   await createAuditLog({
@@ -534,7 +680,7 @@ export async function softDeleteGift(id: string, deletedBy: string): Promise<Gif
  * @returns The {@link Gift} (including soft-deleted), or `null` if not found.
  */
 export async function getDeletedGiftById(id: string): Promise<Gift | null> {
-  return gifts.get(id) ?? null;
+  return findGiftById(id);
 }
 
 /**
@@ -546,14 +692,11 @@ export async function getDeletedGiftById(id: string): Promise<Gift | null> {
  * @returns The number of records hard-deleted.
  */
 export async function hardDeleteExpiredGifts(retentionCutoff: Date): Promise<number> {
-  let count = 0;
-  for (const [id, gift] of gifts.entries()) {
-    if (gift.deletedAt && gift.deletedAt < retentionCutoff) {
-      gifts.delete(id);
-      count++;
-    }
-  }
-  return count;
+  const { rowCount } = await pool.query(
+    `DELETE FROM gifts WHERE deleted_at IS NOT NULL AND deleted_at < $1`,
+    [retentionCutoff]
+  );
+  return rowCount ?? 0;
 }
 
 /**
@@ -565,12 +708,14 @@ export async function hardDeleteExpiredGifts(retentionCutoff: Date): Promise<num
  * @returns The updated {@link Gift}, or `null` if the gift does not exist.
  */
 export async function storeClaimTxHash(id: string, txHash: string): Promise<Gift | null> {
-  const gift = gifts.get(id);
-  if (!gift) return null;
-  gift.claimTxHash = txHash;
-  gift.updatedAt = new Date();
-  gifts.set(id, gift);
-  return gift;
+  const { rows } = await pool.query<Gift>(
+    `UPDATE gifts
+        SET claim_tx_hash = $2, updated_at = NOW()
+      WHERE id = $1
+      RETURNING *`,
+    [id, txHash]
+  );
+  return rows[0] ?? null;
 }
 
 /**
@@ -580,10 +725,11 @@ export async function storeClaimTxHash(id: string, txHash: string): Promise<Gift
  * @returns The matching {@link Gift}, or `null` if not found or soft-deleted.
  */
 export async function getGiftByContractId(contractId: string): Promise<Gift | null> {
-  for (const gift of gifts.values()) {
-    if (gift.contractId === contractId && !gift.deletedAt) return gift;
-  }
-  return null;
+  const { rows } = await pool.query<Gift>(
+    `SELECT * FROM gifts WHERE contract_id = $1 AND deleted_at IS NULL LIMIT 1`,
+    [contractId]
+  );
+  return rows[0] ?? null;
 }
 
 /**
@@ -599,7 +745,7 @@ export async function updateGiftStatusIdempotent(
   id: string,
   status: GiftStatus
 ): Promise<Gift | null> {
-  const gift = gifts.get(id);
+  const gift = await findGiftById(id);
   if (!gift) return null;
   if (gift.status === status) return gift; // already in target state — no-op
   try {
@@ -617,7 +763,11 @@ export async function updateGiftStatusIdempotent(
  * Returns all non-deleted gifts matching a given status.
  */
 export async function getGiftsByStatus(status: GiftStatus): Promise<Gift[]> {
-  return activeGifts().filter((g) => g.status === status);
+  const { rows } = await pool.query<Gift>(
+    `SELECT * FROM gifts WHERE status = $1 AND deleted_at IS NULL`,
+    [status]
+  );
+  return rows;
 }
 
 /**

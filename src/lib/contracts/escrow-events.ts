@@ -36,31 +36,47 @@
  * | 1     | I128         | amount transferred in USDC stroops      |
  *
  * ### `cancelled`
- * Emitted by `cancel()` — sender cancelled, funds returned (terminal).
+ * Emitted by `cancel(reason: u32)` — sender cancelled, funds returned (terminal).
  *
  * ```
  * topics: ["cancelled"]
- * data:   ScVec [sender: ScAddress, amount: I128]
+ * data:   ScVec [sender: ScAddress, amount: I128, reason: U32]
  * ```
  *
  * | Index | Soroban type | Description                             |
  * |-------|--------------|---------------------------------------------|
  * | 0     | ScAddress    | sender — address that received refund   |
  * | 1     | I128         | amount refunded in USDC stroops         |
+ * | 2     | U32          | reason code (see table below)           |
  *
- * ### `upgraded` (admin-only, not decoded here)
- * Emitted by `upgrade()`.
+ * Cancellation reason codes:
+ *
+ * | Code | Name             | Description                              |
+ * |------|------------------|------------------------------------------|
+ * | 1    | sender_requested | Sender explicitly cancelled the gift     |
+ * | 2    | expired          | Gift expired and was cancelled           |
+ * | 3    | admin            | Cancelled by an admin                    |
+ *
+ * ### `upgraded` (admin-only)
+ * Emitted by `upgrade()` — contract WASM was replaced (terminal for the old code).
  *
  * ```
  * topics: ["upgraded"]
  * data:   ScVec [old_contract: ScAddress, new_wasm_hash: Bytes(32)]
  * ```
  *
+ * | Index | Soroban type | Description                                  |
+ * |-------|--------------|----------------------------------------------|
+ * | 0     | ScAddress    | old_contract — address of the upgraded contract |
+ * | 1     | Bytes(32)    | new_wasm_hash — 32-byte hash of the new WASM |
+ *
  * ## Versioning
  *
- * Schema version: **v1**. Breaking changes require a new topic name (e.g.
- * `initialized_v2`). Additive changes that append optional fields must update
- * this JSDoc and `docs/contract-events.md`.
+ * Schema version: **v2**. The `cancelled` payload gained a trailing `reason`
+ * (U32) field in v2; the `cancel(reason: u32)` signature is a breaking change
+ * (callers must now pass a reason code). Breaking changes require a new topic
+ * name (e.g. `initialized_v2`). Additive changes that append optional fields
+ * must update this JSDoc and `docs/contract-events.md`.
  *
  * ## Full documentation
  *
@@ -72,7 +88,7 @@ import { rpc as SorobanRpc, Address, scValToNative, xdr } from "@stellar/stellar
 
 // ─── Event type discriminants ─────────────────────────────────────────────────
 
-export type EscrowEventType = "initialized" | "claimed" | "cancelled";
+export type EscrowEventType = "initialized" | "claimed" | "cancelled" | "upgraded";
 
 // ─── Typed event payloads ─────────────────────────────────────────────────────
 
@@ -106,9 +122,21 @@ export interface CancelledEvent {
   txHash: string;
   sender: string;
   amount: bigint;
+  /** Cancellation reason code: 1=sender_requested, 2=expired, 3=admin. */
+  reason: number;
 }
 
-export type EscrowEvent = InitializedEvent | ClaimedEvent | CancelledEvent;
+export interface UpgradedEvent {
+  type: "upgraded";
+  contractId: string;
+  ledger: number;
+  ledgerClosedAt: string;
+  txHash: string;
+  oldContract: string;
+  newWasmHash: string;
+}
+
+export type EscrowEvent = InitializedEvent | ClaimedEvent | CancelledEvent | UpgradedEvent;
 
 // ─── Cursor helpers ───────────────────────────────────────────────────────────
 
@@ -218,6 +246,9 @@ function parseEventResponse(raw: SorobanRpc.Api.EventResponse): EscrowEvent | nu
     if (eventName === "cancelled") {
       return decodeCancelledEvent(base, dataVal);
     }
+    if (eventName === "upgraded") {
+      return decodeUpgradedEvent(base, dataVal);
+    }
   } catch (err) {
     console.warn("[escrow-events] failed to decode event", eventName, err);
   }
@@ -258,16 +289,34 @@ function decodeClaimedEvent(
 }
 
 function decodeCancelledEvent(
-  base: Omit<CancelledEvent, "type" | "sender" | "amount">,
+  base: Omit<CancelledEvent, "type" | "sender" | "amount" | "reason">,
   data: xdr.ScVal
 ): CancelledEvent {
   const items = data.vec();
-  if (!items || items.length !== 2) throw new Error("unexpected cancelled data shape");
-  const [senderVal, amountVal] = items;
+  if (!items || items.length !== 3) throw new Error("unexpected cancelled data shape");
+  const [senderVal, amountVal, reasonVal] = items;
   return {
     ...base,
     type: "cancelled",
     sender: Address.fromScVal(senderVal).toString(),
     amount: BigInt(scValToNative(amountVal) as number | bigint),
+    reason: Number(scValToNative(reasonVal) as number | bigint),
+  };
+}
+
+function decodeUpgradedEvent(
+  base: Omit<UpgradedEvent, "type" | "oldContract" | "newWasmHash">,
+  data: xdr.ScVal
+): UpgradedEvent {
+  const items = data.vec();
+  if (!items || items.length !== 2) throw new Error("unexpected upgraded data shape");
+  const [oldContractVal, newWasmHashVal] = items;
+  const hashBytes = newWasmHashVal.bytes();
+  if (!hashBytes || hashBytes.length !== 32) throw new Error("unexpected upgraded wasm hash shape");
+  return {
+    ...base,
+    type: "upgraded",
+    oldContract: Address.fromScVal(oldContractVal).toString(),
+    newWasmHash: Buffer.from(hashBytes).toString("hex"),
   };
 }

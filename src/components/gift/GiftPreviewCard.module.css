@@ -122,11 +122,76 @@
   border-top: 1px solid var(--color-border-subtle);
 }
 
+/* ─── Compact / mini variant (ThemePicker swatch) ─────────────────────────── */
+.card.compact {
+  padding: var(--space-3);
+  gap: var(--space-2);
+  border-radius: var(--radius-lg);
+  aspect-ratio: 3 / 4;
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  justify-content: flex-start;
+  /* Keep theme variables (incl. dark-mode overrides) intact */
+  background: linear-gradient(135deg, var(--color-bg-elevated) 0%, var(--color-bg-surface) 100%);
+  color: var(--color-text-primary);
+}
+
+.compact .header {
+  gap: var(--space-2);
+  flex-wrap: nowrap;
+}
+
+.compact .emoji {
+  font-size: 1.25rem;
+}
+
+.compact .occasion {
+  font-size: 0.5rem;
+  letter-spacing: 0.03em;
+}
+
+.compact .to {
+  font-size: var(--text-xs);
+  margin: 0;
+}
+
+.compact .amount {
+  font-size: var(--text-base);
+  padding: var(--space-2) 0;
+}
+
+.compact .row {
+  font-size: 0.625rem;
+  gap: var(--space-1);
+  flex-wrap: nowrap;
+}
+
+.compact .rowLabel {
+  font-size: 0.5rem;
+  min-width: 0;
+}
+
+.compact .message {
+  font-size: 0.625rem;
+  gap: var(--space-1);
+}
+
+.compact .edit,
+.compact .hint {
+  display: none;
+}
+
 /* ─── Mobile (≤ 480px) ────────────────────────────────────────────────────── */
 @media (max-width: 480px) {
   .card {
     padding: var(--space-4);
     border-radius: var(--radius-xl);
+  }
+
+  .card.compact {
+    padding: var(--space-2);
+    border-radius: var(--radius-md);
   }
 
   .amount {

@@ -258,6 +258,9 @@ export async function creditReferralOnFirstPayment(refereeId: string): Promise<b
       [randomUUID(), referral.referrer_id, REFERRAL_BONUS_NGN, referral.id]
     );
 
+    // Notify the referrer that their reward has been credited
+    await notifyReferrerOfCredit(referral.referrer_id, REFERRAL_BONUS_NGN);
+
     // Credit the referee ₦500
     await client.query(
       "INSERT INTO referral_credits (id, user_id, amount_ngn, source_referral_id, type, expires_at) VALUES ($1, $2, $3, $4, 'referral_bonus', NOW() + INTERVAL '90 days')",
@@ -284,6 +287,34 @@ export async function creditReferralOnFirstPayment(refereeId: string): Promise<b
     throw err;
   } finally {
     client.release();
+  }
+}
+
+/**
+ * Sends an email notification to the referrer when their referral reward is
+ * credited. Failures are logged but never block the credit itself.
+ *
+ * @param referrerId - The referrer's UUID.
+ * @param amountNgn - The reward amount credited.
+ */
+async function notifyReferrerOfCredit(referrerId: string, amountNgn: number): Promise<void> {
+  try {
+    const { rows } = await pool.query<{ email: string | null; display_name: string | null }>(
+      "SELECT email, display_name FROM users WHERE id = $1 LIMIT 1",
+      [referrerId]
+    );
+
+    const email = rows[0]?.email;
+    if (!email) return;
+
+    const { sendReferralCreditEmail } = await import("@/lib/email");
+    await sendReferralCreditEmail({
+      to: email,
+      name: rows[0]?.display_name ?? "there",
+      amountNgn,
+    });
+  } catch (err) {
+    console.error("[referral] notifyReferrerOfCredit failed:", err);
   }
 }
 
@@ -394,6 +425,32 @@ export async function getReferralAttribution(
     creditedAt: row.credited_at,
     createdAt: new Date(row.created_at),
   }));
+}
+
+// ─── Gift Status Transition Hook ─────────────────────────────────────────────
+
+/**
+ * Called when a gift transitions to `funded`. If the gift's sender was
+ * referred and this is their first successful gift, credits the referral
+ * reward (referrer + referee) and notifies the referrer by email.
+ *
+ * Idempotent: the referral is only credited once (status moves from
+ * `pending` to `credited`), so repeated `funded` transitions are no-ops.
+ *
+ * @param giftId - The gift that transitioned to `funded`.
+ * @returns true if a referral reward was applied by this call.
+ */
+export async function handleGiftFunded(giftId: string): Promise<boolean> {
+  const { rows } = await pool.query<{ sender_id: string }>(
+    "SELECT sender_id FROM gifts WHERE id = $1 LIMIT 1",
+    [giftId]
+  );
+
+  if (rows.length === 0 || !rows[0].sender_id) {
+    return false;
+  }
+
+  return creditReferralOnFirstPayment(rows[0].sender_id);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

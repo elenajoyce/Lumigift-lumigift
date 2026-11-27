@@ -32,6 +32,31 @@ import {
   VISUAL_SEED_EPOCH,
 } from "./fixtures";
 
+// ─── Exchange rate mock ────────────────────────────────────────────────────────
+
+/**
+ * Fixed exchange-rate quote used by the currency toggle (Issue #494).
+ *
+ * The quote endpoint returns a `fetchedAt` timestamp; anchoring it to the
+ * frozen clock keeps the "Rate as of HH:MM" label deterministic across runs.
+ */
+const EXCHANGE_RATE_QUOTE = {
+  base: "USD",
+  quote: "NGN",
+  rate: 1500,
+  fetchedAt: new Date(VISUAL_SEED_EPOCH).toISOString(),
+};
+
+async function mockExchangeRate(page: Page): Promise<void> {
+  await page.route("**/api/v1/exchange-rate/quote**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(EXCHANGE_RATE_QUOTE),
+    })
+  );
+}
+
 // ─── Clock freeze ──────────────────────────────────────────────────────────────
 
 /**
@@ -93,6 +118,45 @@ test("CreateGiftForm — visual snapshot", async ({ page }) => {
   await page.goto("/send");
   const form = page.locator("form");
   await expect(form).toHaveScreenshot("create-gift-form.png");
+});
+
+test("CreateGiftForm — NGN/USD currency toggle", async ({ page }) => {
+  await freezeClock(page);
+  await mockExchangeRate(page);
+  await page.route("**/api/auth/session", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        user: { id: "seed-user-1", phone: "+2348011111111" },
+        expires: new Date(VISUAL_SEED_EPOCH + 86_400_000).toISOString(),
+      }),
+    })
+  );
+  await page.goto("/send");
+
+  // Toggle from NGN to USD so the converted amount and rate label are visible
+  const toggle = page.getByRole("button", { name: /usd/i });
+  await toggle.click();
+
+  const form = page.locator("form");
+  await expect(form).toHaveScreenshot("create-gift-form-usd-toggle.png");
+});
+
+// ─── Input / Textarea (inline-style migration, Issue #498) ────────────────────
+
+test("Input — with hint", async ({ page }) => {
+  await freezeClock(page);
+  await page.goto("/");
+  const input = page.locator("[data-testid='input-with-hint']").first();
+  await expect(input).toHaveScreenshot("input-with-hint.png");
+});
+
+test("Textarea — with hint", async ({ page }) => {
+  await freezeClock(page);
+  await page.goto("/");
+  const textarea = page.locator("[data-testid='textarea-with-hint']").first();
+  await expect(textarea).toHaveScreenshot("textarea-with-hint.png");
 });
 
 // ─── GiftCard states ──────────────────────────────────────────────────────────
@@ -158,4 +222,30 @@ test("GiftCard — claimed state", async ({ page }) => {
   await page.goto(`/gifts/${GIFT_CLAIMED.id}`);
   const card = page.locator("article").first();
   await expect(card).toHaveScreenshot("gift-card-claimed.png");
+});
+
+// ─── Gift detail loading skeleton ─────────────────────────────────────────────
+
+/**
+ * Visual snapshot of the `/gifts/[id]` loading skeleton (loading.tsx).
+ *
+ * The gift detail API response is delayed indefinitely so the route segment
+ * stays in its Suspense fallback (loading.tsx) while the screenshot is taken.
+ * The clock is frozen and the mocked payload matches the seed data so the
+ * skeleton renders deterministically across CI runs.
+ */
+test("GiftDetail — loading skeleton", async ({ page }) => {
+  await freezeClock(page);
+
+  // Never resolve the gift API request so loading.tsx remains rendered.
+  await page.route(`**/api/v1/gifts/${GIFT_LOCKED.id}`, () => {
+    /* intentionally left pending */
+  });
+
+  await page.goto(`/gifts/${GIFT_LOCKED.id}`, { waitUntil: "commit" });
+
+  // Wait for the skeleton container to be visible before snapshotting.
+  const skeleton = page.getByTestId("gift-detail-skeleton");
+  await expect(skeleton).toBeVisible();
+  await expect(skeleton).toHaveScreenshot("gift-detail-loading.png");
 });

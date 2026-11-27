@@ -26,11 +26,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
           {...props}
         />
         {hint && !error && (
-          <span
-            id={`${inputId}-hint`}
-            className="input-error-msg"
-            style={{ color: "var(--color-text-muted)" }}
-          >
+          <span id={`${inputId}-hint`} className="input-hint">
             {hint}
           </span>
         )}

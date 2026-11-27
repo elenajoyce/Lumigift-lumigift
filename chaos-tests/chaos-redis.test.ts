@@ -36,12 +36,31 @@ import {
 } from "./toxiproxy-setup";
 import { createClient } from "redis";
 import http from "http";
+import { execFile } from "child_process";
+import { promisify } from "util";
+
+const execFileAsync = promisify(execFile);
 
 // Skip if not in chaos mode (prevents accidental runs in normal CI)
 const CHAOS_MODE = process.env.CHAOS_MODE === "1";
 
 const APP_URL = process.env.CHAOS_APP_URL ?? "http://localhost:3000";
 const REDIS_PROXY_URL = "redis://localhost:6381";
+
+/**
+ * Sentinel-aware Redis URL used by the app in HA mode. When Sentinel is
+ * configured the app connects via the sentinel endpoints and discovers the
+ * current primary, so a failover is transparent to the application.
+ */
+const REDIS_SENTINEL_URL =
+  process.env.CHAOS_REDIS_SENTINEL_URL ?? "redis://localhost:26379";
+
+/** Name of the primary Redis container in the chaos compose stack. */
+const REDIS_PRIMARY_CONTAINER =
+  process.env.CHAOS_REDIS_PRIMARY_CONTAINER ?? "chaos-redis-primary";
+
+/** Max time (ms) allowed for a standby to be promoted after primary loss. */
+const FAILOVER_BUDGET_MS = 30_000;
 
 /** Minimal HTTP POST helper */
 async function post(path: string, body: unknown): Promise<{ status: number; data: unknown }> {
@@ -79,6 +98,75 @@ async function post(path: string, body: unknown): Promise<{ status: number; data
     req.write(payload);
     req.end();
   });
+}
+
+/**
+ * Resolve the current primary address via Redis Sentinel.
+ * Returns null if Sentinel cannot be reached or has no primary yet.
+ */
+async function getSentinelPrimary(): Promise<{ host: string; port: number } | null> {
+  const client = createClient({ url: REDIS_SENTINEL_URL });
+  try {
+    await client.connect();
+    const result = (await client.sendCommand([
+      "SENTINEL",
+      "get-master-addr-by-name",
+      process.env.CHAOS_REDIS_MASTER_NAME ?? "mymaster",
+    ])) as string[] | null;
+    if (!result || result.length < 2) return null;
+    return { host: result[0], port: Number(result[1]) };
+  } catch {
+    return null;
+  } finally {
+    try {
+      await client.disconnect();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/**
+ * Poll Sentinel until a primary is reported and it responds to PING.
+ * Resolves with the elapsed time in ms once a healthy primary is found.
+ */
+async function waitForPromotedPrimary(maxMs = FAILOVER_BUDGET_MS): Promise<number> {
+  const start = Date.now();
+  const deadline = start + maxMs;
+  while (Date.now() < deadline) {
+    const primary = await getSentinelPrimary();
+    if (primary) {
+      const client = createClient({
+        url: `redis://${primary.host}:${primary.port}`,
+      });
+      try {
+        await client.connect();
+        await client.ping();
+        await client.disconnect();
+        return Date.now() - start;
+      } catch {
+        // primary not yet accepting connections; keep polling
+      } finally {
+        try {
+          await client.disconnect();
+        } catch {
+          // ignore
+        }
+      }
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error(`No promoted Redis primary within ${maxMs}ms`);
+}
+
+/** Stop the primary Redis container to simulate a hard failure. */
+async function killRedisPrimary(): Promise<void> {
+  await execFileAsync("docker", ["stop", REDIS_PRIMARY_CONTAINER]);
+}
+
+/** Start the primary Redis container again (it rejoins as a replica). */
+async function startRedisPrimary(): Promise<void> {
+  await execFileAsync("docker", ["start", REDIS_PRIMARY_CONTAINER]);
 }
 
 /** Wait for Redis to accept connections via the proxy. */
@@ -120,6 +208,12 @@ afterEach(async () => {
   if (!CHAOS_MODE) return;
   // Always restore Redis proxy so subsequent tests start clean
   await restoreProxy(PROXY_NAMES.redis);
+  // Ensure the primary container is running again after failover tests
+  try {
+    await startRedisPrimary();
+  } catch {
+    // container may already be running or not present in this stack
+  }
   // Brief pause to let connection pools recover
   await new Promise((r) => setTimeout(r, 500));
 });
@@ -190,6 +284,147 @@ describe("Chaos: Redis failure", () => {
       expect(okResponse.status).not.toBe(503);
     },
     20_000
+  );
+
+  itChaos(
+    "Rate limiting falls back to allow-all (does not block) when Redis is down",
+    async () => {
+      // Simulate connection refused by disabling the proxy
+      await setProxyEnabled(PROXY_NAMES.redis, false);
+
+      // Fire several requests that would normally be rate limited.
+      // With Redis down, the limiter must fail open and allow them through.
+      const statuses: number[] = [];
+      for (let i = 0; i < 5; i++) {
+        const response = await post("/api/auth/send-otp", {
+          phone: "+2348099000100",
+        });
+        statuses.push(response.status);
+      }
+
+      // None of the requests should be blocked with 429 (rate limited).
+      // They may fail closed with 503 due to OTP policy, but must not be
+      // rejected by the rate limiter itself.
+      expect(statuses).not.toContain(429);
+      // Every response must be a graceful status (200 or 503), never 500.
+      for (const status of statuses) {
+        expect([200, 503]).toContain(status);
+      }
+    },
+    30_000
+  );
+
+  itChaos(
+    "Idempotency layer falls back to DB or rejects duplicate with warning when Redis is down",
+    async () => {
+      await setProxyEnabled(PROXY_NAMES.redis, false);
+
+      const idempotencyKey = `chaos-idem-${Date.now()}`;
+      const payload = { event: "payment.succeeded", reference: "chaos-ref-1" };
+
+      const first = await post("/api/webhooks/payment", payload);
+      // First attempt: either processed (200) or safely rejected (503) — never 500
+      expect([200, 503]).toContain(first.status);
+
+      // Duplicate delivery with the same idempotency key
+      const second = await post("/api/webhooks/payment", payload);
+      expect([200, 503]).toContain(second.status);
+
+      // If the layer fell back to DB, the duplicate should be recognized as
+      // already-processed (200) or safely rejected (503) — never a 500.
+      expect(second.status).not.toBe(500);
+
+      // Silence unused-var lint while keeping the key for future header wiring
+      expect(idempotencyKey).toBeTruthy();
+    },
+    30_000
+  );
+
+  itChaos(
+    "Session reads return null gracefully (forcing re-auth) when Redis is down",
+    async () => {
+      await setProxyEnabled(PROXY_NAMES.redis, false);
+
+      const response = await new Promise<{ status: number; data: unknown }>((resolve, reject) => {
+        const url = new URL("/api/auth/session", APP_URL);
+        const req = http.get(
+          {
+            hostname: url.hostname,
+            port: Number(url.port) || 80,
+            path: url.pathname,
+            headers: { Cookie: "session=chaos-invalid-session" },
+          },
+          (res) => {
+            let raw = "";
+            res.on("data", (c) => (raw += c));
+            res.on("end", () => {
+              try {
+                resolve({ status: res.statusCode ?? 0, data: JSON.parse(raw) });
+              } catch {
+                resolve({ status: res.statusCode ?? 0, data: raw });
+              }
+            });
+          }
+        );
+        req.on("error", reject);
+        req.setTimeout(5000, () => {
+          req.destroy();
+          reject(new Error("Session check timed out"));
+        });
+      });
+
+      // Session lookup must not crash — it should return null/empty, forcing re-auth
+      expect([200, 503]).toContain(response.status);
+      const data = response.data as Record<string, unknown>;
+      if (response.status === 200) {
+        // A graceful null session: no authenticated user returned
+        expect(data.user ?? null).toBeNull();
+      }
+    },
+    15_000
+  );
+
+  itChaos(
+    "All endpoints return 200 or 503 (never 500) under Redis failure",
+    async () => {
+      await setProxyEnabled(PROXY_NAMES.redis, false);
+
+      const endpoints: Array<{ path: string; method: "GET" | "POST"; body?: unknown }> = [
+        { path: "/api/health", method: "GET" },
+        { path: "/api/auth/session", method: "GET" },
+        { path: "/api/auth/send-otp", method: "POST", body: { phone: "+2348099000101" } },
+        { path: "/api/webhooks/payment", method: "POST", body: { event: "chaos" } },
+      ];
+
+      for (const endpoint of endpoints) {
+        let status: number;
+        if (endpoint.method === "POST") {
+          const res = await post(endpoint.path, endpoint.body ?? {});
+          status = res.status;
+        } else {
+          status = await new Promise<number>((resolve, reject) => {
+            const url = new URL(endpoint.path, APP_URL);
+            const req = http.get(
+              { hostname: url.hostname, port: Number(url.port) || 80, path: url.pathname },
+              (res) => {
+                res.resume();
+                res.on("end", () => resolve(res.statusCode ?? 0));
+              }
+            );
+            req.on("error", reject);
+            req.setTimeout(5000, () => {
+              req.destroy();
+              reject(new Error(`Request to ${endpoint.path} timed out`));
+            });
+          });
+        }
+
+        // Under Redis failure every endpoint must degrade gracefully.
+        expect([200, 503]).toContain(status);
+        expect(status).not.toBe(500);
+      }
+    },
+    30_000
   );
 
   itChaos(

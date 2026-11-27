@@ -5,6 +5,10 @@ import { gifts, updateGiftStatus, isGiftUnlocked } from "./gift.service";
 import { incrementFunnelCounter } from "@/lib/metrics";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+
+/** Default grace period (hours) applied when a gift's `grace_period_hours` is NULL. */
+const DEFAULT_GRACE_PERIOD_HOURS = 72;
 
 /**
  * Unlock scheduler — checks for gifts whose `unlockAt` has passed (inclusive: `now >= unlockAt`)
@@ -35,6 +39,7 @@ interface GiftRow {
   sender_stellar_key: string | null;
   recipient_phone: string | null;
   amount_usdc: string;
+  grace_period_hours: number | null;
 }
 
 /**
@@ -63,10 +68,21 @@ export async function processExpiries(): Promise<void> {
   try {
     await client.query("BEGIN");
 
-    // Phase 1: start grace period for newly expired gifts
+    // Phase 1: start grace period for newly expired gifts.
+    // A gift only qualifies once its *own* grace period (per-gift
+    // `grace_period_hours`, default 72h for personal/business accounts
+    // alike unless explicitly configured) has elapsed since unlock_at —
+    // in addition to the 365-day unclaimed cutoff.
     const { rows: pending } = await client.query<GiftRow>(
-      "SELECT id, status, unlock_at, contract_id, sender_stellar_key, recipient_phone, amount_usdc FROM gifts WHERE status = 'unlocked' AND unlock_at <= $1 ORDER BY unlock_at ASC FOR UPDATE SKIP LOCKED",
-      [cutoff]
+      `SELECT id, status, unlock_at, contract_id, sender_stellar_key, recipient_phone,
+              amount_usdc, grace_period_hours
+       FROM gifts
+       WHERE status = 'unlocked'
+         AND unlock_at <= $1
+         AND NOW() > unlock_at + (COALESCE(grace_period_hours, $2) * INTERVAL '1 hour')
+       ORDER BY unlock_at ASC
+       FOR UPDATE SKIP LOCKED`,
+      [cutoff, DEFAULT_GRACE_PERIOD_HOURS]
     );
 
     for (const gift of pending) {

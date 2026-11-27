@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { getGiftById, hashPhone } from "@/server/services/gift.service";
-import { claimGift } from "@/server/services/claim.service";
+import { claimGift, GiftAlreadyClaimedError } from "@/server/services/claim.service";
 import { claimGiftSchema } from "@/types/schemas";
 import { withErrorHandler, withCsrf, validateBody } from "@/server/middleware";
 import { checkClaimAttempt, recordClaimFailure } from "@/server/services/claim-guard.service";
@@ -81,11 +81,23 @@ export const POST = withErrorHandler(
       await claimInvitation(invitation.id);
     }
 
-    const { txHash } = await claimGift(gift, validation.data.recipientStellarKey);
+    try {
+      const { txHash } = await claimGift(gift, validation.data.recipientStellarKey);
 
-    return NextResponse.json<ApiResponse<{ txHash: string }>>({
-      success: true,
-      data: { txHash },
-    });
+      return NextResponse.json<ApiResponse<{ txHash: string }>>({
+        success: true,
+        data: { txHash },
+      });
+    } catch (err) {
+      if (err instanceof GiftAlreadyClaimedError) {
+        // DB-level guard caught a concurrent claim — not an error, just a
+        // lost race. The Redis claim-guard should normally prevent this.
+        return NextResponse.json<ApiResponse<never>>(
+          { success: false, error: "Gift has already been claimed" },
+          { status: 409 }
+        );
+      }
+      throw err;
+    }
   })
 );

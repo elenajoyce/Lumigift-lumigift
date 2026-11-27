@@ -28,7 +28,9 @@ async function mockSession(page: Page, state: { loggedIn: boolean }) {
   );
 }
 
-test("SMS link → login → claim resolves the gift", async ({ page }) => {
+test("cold start: SMS link → login → claim resolves the gift and clears the token", async ({
+  page,
+}) => {
   const session = { loggedIn: false };
   await mockSession(page, session);
 
@@ -42,8 +44,15 @@ test("SMS link → login → claim resolves the gift", async ({ page }) => {
     });
   });
 
+  // Cold start: unauthenticated user opens the SMS deep link
   await page.goto(`/claim?token=${TOKEN}`);
   await expect(page).toHaveURL(/\/auth\/login\?callbackUrl=%2Fclaim/);
+
+  // Token must be persisted before the auth redirect so it survives login
+  const storedToken = await page.evaluate(() =>
+    sessionStorage.getItem("pendingClaimToken")
+  );
+  expect(storedToken).toBe(TOKEN);
 
   // Login completes and NextAuth returns the user to the callbackUrl (no token in URL)
   session.loggedIn = true;
@@ -51,9 +60,17 @@ test("SMS link → login → claim resolves the gift", async ({ page }) => {
 
   await expect(page).toHaveURL(new RegExp(`/gifts/${GIFT_ID}`));
   expect(requestedToken).toBe(TOKEN);
+
+  // Token is cleared from sessionStorage after a successful claim
+  const clearedToken = await page.evaluate(() =>
+    sessionStorage.getItem("pendingClaimToken")
+  );
+  expect(clearedToken).toBeNull();
 });
 
-test("expired claim token shows an informative error", async ({ page }) => {
+test("expired claim token shows an informative error and clears the stored token", async ({
+  page,
+}) => {
   await mockSession(page, { loggedIn: true });
   await page.route("**/api/v1/gifts/claim-token**", (route) =>
     route.fulfill({
@@ -65,4 +82,10 @@ test("expired claim token shows an informative error", async ({ page }) => {
 
   await page.goto(`/claim?token=${TOKEN}`);
   await expect(page.getByRole("alert")).toHaveText(/expired/i);
+
+  // Token is cleared from sessionStorage after a failed claim
+  const clearedToken = await page.evaluate(() =>
+    sessionStorage.getItem("pendingClaimToken")
+  );
+  expect(clearedToken).toBeNull();
 });

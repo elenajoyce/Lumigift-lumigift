@@ -26,8 +26,21 @@ export interface TransactionPage {
   totalPages: number;
 }
 
+export interface CursorTransactionPage {
+  items: TransactionRecord[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  limit: number;
+}
+
 export interface TransactionFilters {
   page?: number;
+  limit?: number;
+  status?: string;
+}
+
+export interface CursorTransactionFilters {
+  cursor?: string;
   limit?: number;
   status?: string;
 }
@@ -50,6 +63,34 @@ export interface ReceiptData {
 const DEFAULT_PAGE = 1;
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 100;
+
+const DEFAULT_CURSOR_LIMIT = 20;
+const MAX_CURSOR_LIMIT = 50;
+
+interface CursorPayload {
+  createdAt: string;
+  giftId: string;
+}
+
+function encodeCursor(payload: CursorPayload): string {
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+}
+
+function decodeCursor(cursor: string): CursorPayload | null {
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (
+      parsed &&
+      typeof parsed.createdAt === "string" &&
+      typeof parsed.giftId === "string"
+    ) {
+      return parsed as CursorPayload;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 // ─── Service functions ────────────────────────────────────────────────────────
 
@@ -129,6 +170,88 @@ export async function getTransactionHistory(
     limit,
     totalPages: Math.ceil(total / limit),
   };
+}
+
+/**
+ * Returns a cursor-paginated transaction history for a user (issue #511).
+ *
+ * Uses keyset pagination on `(created_at, id)` instead of OFFSET so query
+ * cost stays flat as users accumulate transaction history, instead of
+ * degrading linearly with page depth.
+ *
+ * @param userId  - UUID of the authenticated sender.
+ * @param filters - Optional cursor, limit (max 50, default 20) and status filter.
+ */
+export async function getTransactionHistoryByCursor(
+  userId: string,
+  filters: CursorTransactionFilters = {}
+): Promise<CursorTransactionPage> {
+  const limit = Math.min(MAX_CURSOR_LIMIT, Math.max(1, filters.limit ?? DEFAULT_CURSOR_LIMIT));
+
+  const params: (string | number)[] = [userId];
+  let statusClause = "";
+  if (filters.status) {
+    params.push(filters.status);
+    statusClause = `AND g.status = $${params.length}`;
+  }
+
+  let cursorClause = "";
+  if (filters.cursor) {
+    const decoded = decodeCursor(filters.cursor);
+    if (decoded) {
+      params.push(decoded.createdAt, decoded.giftId);
+      // Strict keyset predicate: rows strictly after the cursor position,
+      // ordered by created_at DESC, id DESC (tie-breaker for equal timestamps).
+      cursorClause = `AND (g.created_at, g.id) < ($${params.length - 1}::timestamptz, $${params.length})`;
+    }
+  }
+
+  // Fetch one extra row to determine hasMore without a second COUNT query.
+  const dataQuery = `
+    SELECT
+      g.id           AS "giftId",
+      p.amount_ngn   AS amount,
+      p.provider,
+      g.stellar_tx_hash AS "stellarTxHash",
+      g.status,
+      g.created_at   AS "createdAt"
+    FROM gifts g
+    LEFT JOIN payments p ON p.gift_id = g.id
+    WHERE g.sender_id = $1
+    ${statusClause}
+    ${cursorClause}
+    ORDER BY g.created_at DESC, g.id DESC
+    LIMIT ${limit + 1}
+  `;
+
+  const result = await readPool.query<{
+    giftId: string;
+    amount: number;
+    provider: string;
+    stellarTxHash: string | null;
+    status: string;
+    createdAt: Date;
+  }>(dataQuery, params);
+
+  const hasMore = result.rows.length > limit;
+  const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
+
+  const items: TransactionRecord[] = rows.map((row) => ({
+    giftId: row.giftId,
+    amount: row.amount ?? 0,
+    provider: row.provider ?? "unknown",
+    stellarTxHash: row.stellarTxHash ?? null,
+    status: row.status,
+    createdAt: row.createdAt,
+  }));
+
+  const last = rows[rows.length - 1];
+  const nextCursor =
+    hasMore && last
+      ? encodeCursor({ createdAt: new Date(last.createdAt).toISOString(), giftId: last.giftId })
+      : null;
+
+  return { items, nextCursor, hasMore, limit };
 }
 
 /**

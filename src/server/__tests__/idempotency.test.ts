@@ -37,6 +37,14 @@ jest.mock("@/lib/logger", () => ({
   serviceLogger: () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn() }),
 }));
 
+// ─── Gift service mock ────────────────────────────────────────────────────────
+
+jest.mock("@/server/gift-service", () => ({
+  createGift: jest.fn(),
+}));
+
+const createGiftMock = createGift as jest.Mock;
+
 import {
   checkIdempotencyKey,
   storeIdempotencyResponse,
@@ -45,6 +53,8 @@ import {
   isValidIdempotencyKey,
   IDEMPOTENCY_TTL_SECONDS,
 } from "@/server/idempotency";
+import { POST as createGiftRoute } from "@/app/api/v1/gifts/route";
+import { createGift } from "@/server/gift-service";
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
 
@@ -203,5 +213,82 @@ describe("storeIdempotencyResponse", () => {
     expect(record.status).toBe(201);
     expect(JSON.parse(record.body)).toEqual(body);
     expect(record.payloadHash).toBe(payloadHash);
+  });
+});
+
+// ─── POST /api/v1/gifts integration ──────────────────────────────────────────
+
+const GIFT_BODY = {
+  recipientPhone: "+2348012345678",
+  amountNgn: 5000,
+  message: "Happy birthday",
+};
+
+const CREATED_GIFT = {
+  success: true,
+  data: { gift: { id: "gift-1", ...GIFT_BODY }, paymentUrl: "https://pay.example/gift-1" },
+};
+
+function buildRequest(headers: Record<string, string>, body: unknown = GIFT_BODY): Request {
+  return new Request("http://localhost/api/v1/gifts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: JSON.stringify(body),
+  });
+}
+
+describe("POST /api/v1/gifts — idempotency", () => {
+  beforeEach(() => {
+    createGiftMock.mockResolvedValue(CREATED_GIFT);
+  });
+
+  it("creates a gift and returns 201 for a new idempotency key", async () => {
+    const res = await createGiftRoute(buildRequest({ "Idempotency-Key": VALID_KEY }));
+
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual(CREATED_GIFT);
+    expect(createGiftMock).toHaveBeenCalledTimes(1);
+    expect(redisMock.set).toHaveBeenCalledWith(
+      buildIdempotencyRedisKey(expect.any(String), VALID_KEY),
+      expect.any(String),
+      { EX: IDEMPOTENCY_TTL_SECONDS },
+    );
+  });
+
+  it("returns the original response with 200 on a duplicate request", async () => {
+    const first = await createGiftRoute(buildRequest({ "Idempotency-Key": VALID_KEY }));
+    expect(first.status).toBe(201);
+    const firstBody = await first.json();
+
+    // Simulate the stored record being read back on retry.
+    const [[, rawValue]] = (redisMock.set as jest.Mock).mock.calls;
+    redisMock.get.mockResolvedValue(rawValue as string);
+
+    const second = await createGiftRoute(buildRequest({ "Idempotency-Key": VALID_KEY }));
+    expect(second.status).toBe(200);
+    expect(await second.json()).toEqual(firstBody);
+    expect(createGiftMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns 400 when the Idempotency-Key header is missing", async () => {
+    const res = await createGiftRoute(buildRequest({}));
+
+    expect(res.status).toBe(400);
+    expect(createGiftMock).not.toHaveBeenCalled();
+  });
+
+  it("returns 409 when the same key is reused with a different payload", async () => {
+    const first = await createGiftRoute(buildRequest({ "Idempotency-Key": VALID_KEY }));
+    expect(first.status).toBe(201);
+
+    const [[, rawValue]] = (redisMock.set as jest.Mock).mock.calls;
+    redisMock.get.mockResolvedValue(rawValue as string);
+
+    const res = await createGiftRoute(
+      buildRequest({ "Idempotency-Key": VALID_KEY }, { ...GIFT_BODY, amountNgn: 99_999 }),
+    );
+
+    expect(res.status).toBe(409);
+    expect(createGiftMock).toHaveBeenCalledTimes(1);
   });
 });

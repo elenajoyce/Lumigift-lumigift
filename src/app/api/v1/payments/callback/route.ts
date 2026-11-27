@@ -3,6 +3,9 @@ import { verifyPayment } from "@/lib/paystack";
 import { updateGiftStatus } from "@/server/services/gift.service";
 import { validateSlippage } from "@/server/services/exchange-rate.service";
 import { creditReferralOnFirstPayment } from "@/server/services/referral.service";
+import { createAuditLog } from "@/server/services/audit.service";
+import { verifyPaystackSignature } from "@/lib/paystack-signature";
+import { serverConfig } from "@/server/config";
 import { withErrorHandler } from "@/server/middleware";
 
 /** Paystack redirects here after payment. */
@@ -10,6 +13,36 @@ export const GET = withErrorHandler(async (req: NextRequest) => {
   const { searchParams } = new URL(req.url);
   const reference = searchParams.get("reference");
   const giftId = searchParams.get("giftId");
+
+  // ── HMAC signature verification (Issue #502) ────────────────────────────────
+  // Reject any request that does not carry a valid x-paystack-signature header
+  // computed over the raw body with PAYSTACK_SECRET_KEY.
+  const signature = req.headers.get("x-paystack-signature");
+  const rawBody = await req.text();
+  const signatureValid = verifyPaystackSignature(
+    rawBody,
+    signature,
+    serverConfig.paystackSecretKey
+  );
+
+  if (!signatureValid) {
+    try {
+      await createAuditLog({
+        action: "payment_failed",
+        metadata: {
+          reason: signature ? "invalid_signature" : "missing_signature",
+          reference,
+          giftId,
+        },
+      });
+    } catch (err) {
+      console.error("[payments/callback] Audit log failed:", err);
+    }
+    return NextResponse.json(
+      { error: "Invalid Paystack signature" },
+      { status: 401 }
+    );
+  }
 
   if (!reference || !giftId) {
     return NextResponse.redirect(new URL("/error?code=bad_callback", req.url));
@@ -24,7 +57,7 @@ export const GET = withErrorHandler(async (req: NextRequest) => {
       await updateGiftStatus(giftId, "pending_payment");
       const reason = slippage.reason === "rate_expired" ? "rate_expired" : "rate_slippage";
       return NextResponse.redirect(
-        new URL(`/gift/${giftId}/payment-failed?reason=${reason}`, req.url)
+        new URL(`/gifts/${giftId}/payment?status=failed&reason=${reason}`, req.url)
       );
     }
 
@@ -47,9 +80,9 @@ export const GET = withErrorHandler(async (req: NextRequest) => {
       console.error("[payments/callback] Referral credit failed:", err);
     }
 
-    return NextResponse.redirect(new URL(`/gift/${giftId}/success`, req.url));
+    return NextResponse.redirect(new URL(`/gifts/${giftId}/success`, req.url));
   }
 
   await updateGiftStatus(giftId, "pending_payment");
-  return NextResponse.redirect(new URL(`/gift/${giftId}/payment-failed`, req.url));
+  return NextResponse.redirect(new URL(`/gifts/${giftId}/payment?status=failed`, req.url));
 });

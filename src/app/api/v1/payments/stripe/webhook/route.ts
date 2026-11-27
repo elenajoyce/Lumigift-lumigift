@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
 import { updateGiftStatus } from "@/server/services/gift.service";
+import { serverConfig } from "@/server/config";
 import {
   startTimer,
   recordWebhookSuccess,
@@ -13,7 +14,7 @@ import type { ApiResponse } from "@/types";
 let _stripe: Stripe | null = null;
 function getStripe(): Stripe {
   if (!_stripe) {
-    _stripe = new Stripe(process.env.STRIPE_SECRET_KEY ?? "", {
+    _stripe = new Stripe(serverConfig.stripe.secretKey ?? "", {
       apiVersion: "2026-04-22.dahlia",
     });
   }
@@ -29,8 +30,9 @@ export async function POST(req: NextRequest) {
   const elapsed = startTimer();
 
   // Guard moved inside handler so missing env var is a 500 at request time,
-  // not a module-level crash that breaks the build.
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  // not a module-level crash that breaks the build. Loaded from serverConfig
+  // (validated/zod-parsed) rather than process.env directly (issue #512).
+  const webhookSecret = serverConfig.stripe.webhookSecret;
   if (!webhookSecret) {
     recordWebhookFailure("stripe", "unknown", elapsed(), "missing_webhook_secret");
     return NextResponse.json<ApiResponse<never>>(

@@ -22,6 +22,20 @@ describe("normalizePhone", () => {
     expect(normalizePhone("+14155552671")).toBe("+14155552671");
   });
 
+  // ─── International E.164 — at least 5 country codes (issue #469) ────────────
+  const internationalCases: [string, string][] = [
+    ["+14155552671", "+14155552671"], // US (+1)
+    ["+447911123456", "+447911123456"], // UK (+44)
+    ["+4915123456789", "+4915123456789"], // Germany (+49)
+    ["+33612345678", "+33612345678"], // France (+33)
+    ["+27712345678", "+27712345678"], // South Africa (+27)
+    ["+254712345678", "+254712345678"], // Kenya (+254)
+  ];
+
+  test.each(internationalCases)("accepts international E.164 %s → %s", (input, expected) => {
+    expect(normalizePhone(input)).toBe(expected);
+  });
+
   // ─── Invalid inputs must return null ────────────────────────────────────────
   const invalidInputs = [
     "",

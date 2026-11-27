@@ -5,15 +5,38 @@ import styles from "./ThemeToggle.module.css";
 
 type Theme = "dark" | "light";
 
+const STORAGE_KEY = "theme";
+const LIGHT_QUERY = "(prefers-color-scheme: light)";
+
 /**
- * Reads the active theme from localStorage or the OS preference.
+ * Reads the persisted theme from localStorage, if any.
+ * Returns null when the user has never toggled (or the value is invalid).
+ */
+function getStoredTheme(): Theme | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    return stored === "dark" || stored === "light" ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reads the OS colour-scheme preference.
  * Must only be called after mount (requires window).
  */
-function getInitialTheme(): Theme {
+function getSystemTheme(): Theme {
   if (typeof window === "undefined") return "dark";
-  const stored = localStorage.getItem("theme") as Theme | null;
-  if (stored === "dark" || stored === "light") return stored;
-  return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  return window.matchMedia(LIGHT_QUERY).matches ? "light" : "dark";
+}
+
+/**
+ * Resolves the active theme: a stored user preference always wins,
+ * otherwise fall back to the OS preference.
+ */
+function getInitialTheme(): Theme {
+  return getStoredTheme() ?? getSystemTheme();
 }
 
 /**
@@ -44,11 +67,29 @@ export function ThemeToggle() {
     setMounted(true);
   }, []);
 
+  // Follow the OS preference while the user has no stored choice.
+  useEffect(() => {
+    if (!mounted) return;
+    const mql = window.matchMedia(LIGHT_QUERY);
+    const onChange = (event: MediaQueryListEvent) => {
+      if (getStoredTheme() !== null) return;
+      const next: Theme = event.matches ? "light" : "dark";
+      setTheme(next);
+      document.documentElement.setAttribute("data-theme", next);
+    };
+    mql.addEventListener("change", onChange);
+    return () => mql.removeEventListener("change", onChange);
+  }, [mounted]);
+
   function toggle() {
     const next: Theme = theme === "dark" ? "light" : "dark";
     setTheme(next);
     document.documentElement.setAttribute("data-theme", next);
-    localStorage.setItem("theme", next);
+    try {
+      localStorage.setItem(STORAGE_KEY, next);
+    } catch {
+      // Storage may be unavailable (private mode, quota) — theme still applies.
+    }
   }
 
   // Render nothing until mounted — the FOUC-prevention script in layout.tsx

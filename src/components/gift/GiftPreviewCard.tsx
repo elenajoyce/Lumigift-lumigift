@@ -8,14 +8,23 @@ interface GiftPreviewCardProps {
   data: Partial<CreateGiftInput>;
   template?: GiftTemplate;
   onEdit: (step: number) => void;
+  /** Render a small, non-interactive preview (no edit buttons or hint text). */
+  compact?: boolean;
 }
 
-export function GiftPreviewCard({ data, template, onEdit }: GiftPreviewCardProps) {
+export function GiftPreviewCard({ data, template, onEdit, compact = false }: GiftPreviewCardProps) {
   const unlockDate = data.unlockAt ? new Date(data.unlockAt) : null;
   const themeStyle = giftThemeStyle(data.themeId);
+  const cardClassName = [
+    styles.card,
+    themeStyle ? "gift-theme" : null,
+    compact ? styles.compact : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
-    <article className={themeStyle ? `${styles.card} gift-theme` : styles.card} style={themeStyle}>
+    <article className={cardClassName} style={themeStyle}>
       <div className={styles.header}>
         <span className={styles.emoji}>{template?.emoji ?? "🎁"}</span>
         <div>
@@ -31,40 +40,50 @@ export function GiftPreviewCard({ data, template, onEdit }: GiftPreviewCardProps
       <div className={styles.row}>
         <span className={styles.rowLabel}>Phone</span>
         <span>{data.recipientPhone || "—"}</span>
-        <button type="button" className={styles.edit} onClick={() => onEdit(1)}>
-          Edit
-        </button>
+        {!compact && (
+          <button type="button" className={styles.edit} onClick={() => onEdit(1)}>
+            Edit
+          </button>
+        )}
       </div>
 
       <div className={styles.row}>
         <span className={styles.rowLabel}>Amount</span>
         <span>{data.amountNgn ? `₦${data.amountNgn.toLocaleString("en-NG")}` : "—"}</span>
-        <button type="button" className={styles.edit} onClick={() => onEdit(2)}>
-          Edit
-        </button>
+        {!compact && (
+          <button type="button" className={styles.edit} onClick={() => onEdit(2)}>
+            Edit
+          </button>
+        )}
       </div>
 
       <div className={styles.row}>
         <span className={styles.rowLabel}>Unlocks</span>
         <span>{unlockDate ? formatUnlockDate(unlockDate) : "—"}</span>
-        <button type="button" className={styles.edit} onClick={() => onEdit(3)}>
-          Edit
-        </button>
+        {!compact && (
+          <button type="button" className={styles.edit} onClick={() => onEdit(3)}>
+            Edit
+          </button>
+        )}
       </div>
 
       {data.message && (
         <div className={styles.message}>
           <span className={styles.rowLabel}>Message</span>
           <p>{data.message}</p>
-          <button type="button" className={styles.edit} onClick={() => onEdit(2)}>
-            Edit
-          </button>
+          {!compact && (
+            <button type="button" className={styles.edit} onClick={() => onEdit(2)}>
+              Edit
+            </button>
+          )}
         </div>
       )}
 
-      <p className={styles.hint}>
-        🔒 The amount and message will be hidden from the recipient until the unlock date.
-      </p>
+      {!compact && (
+        <p className={styles.hint}>
+          🔒 The amount and message will be hidden from the recipient until the unlock date.
+        </p>
+      )}
     </article>
   );
 }

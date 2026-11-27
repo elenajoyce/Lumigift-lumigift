@@ -10,8 +10,15 @@ import { initializePayment, ngnToKobo } from "@/lib/paystack";
 import { serverConfig } from "@/server/config";
 import { AppError, ERROR_CODES } from "@/server/errors";
 import { createGiftSchema } from "@/types/schemas";
+import { escrowClient } from "@/lib/stellar/escrow-client";
 
 export const MAX_BULK_RECIPIENTS = 500;
+
+/**
+ * Maximum number of gift escrow instances that can be initialised in a single
+ * `batch_initialize` contract call. Mirrors the on-chain limit.
+ */
+export const MAX_BATCH_INITIALIZE_SIZE = 20;
 
 const REQUIRED_COLUMNS = ["recipientName", "recipientPhone", "amountNgn", "unlockAt"] as const;
 
@@ -134,6 +141,70 @@ export async function assertBusinessAccount(userId: string): Promise<void> {
   }
 }
 
+export interface BatchInitializeResult {
+  /** Transaction hashes, one per submitted batch. */
+  txHashes: string[];
+  /** Number of gift instances successfully initialised. */
+  initialized: number;
+  /** Items that could not be initialised, with the reason. */
+  failures: Array<{ index: number; item: BulkGiftItem; error: string }>;
+}
+
+/** Splits `items` into chunks of at most `size` elements. */
+function chunk<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+/**
+ * Initialises escrow instances for a bulk-gift order using the contract's
+ * atomic `batch_initialize` entry point.
+ *
+ * Items are chunked into batches of at most `MAX_BATCH_INITIALIZE_SIZE` (20)
+ * so each Stellar transaction stays within the contract's per-call limit.
+ * A failure in one batch does not abort the remaining batches; the failed
+ * items are reported in `failures` for partial-failure handling.
+ */
+export async function batchInitializeGifts(
+  userId: string,
+  items: BulkGiftItem[]
+): Promise<BatchInitializeResult> {
+  if (items.length === 0) {
+    return { txHashes: [], initialized: 0, failures: [] };
+  }
+
+  const result: BatchInitializeResult = { txHashes: [], initialized: 0, failures: [] };
+  const batches = chunk(items, MAX_BATCH_INITIALIZE_SIZE);
+
+  for (let b = 0; b < batches.length; b++) {
+    const batch = batches[b];
+    const offset = b * MAX_BATCH_INITIALIZE_SIZE;
+    try {
+      const { txHash } = await escrowClient.batchInitialize({
+        senderId: userId,
+        gifts: batch.map((item) => ({
+          recipientPhone: item.recipientPhone,
+          amountNgn: item.amountNgn,
+          unlockAt: item.unlockAt,
+          message: item.message,
+        })),
+      });
+      result.txHashes.push(txHash);
+      result.initialized += batch.length;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Batch initialization failed";
+      batch.forEach((item, i) => {
+        result.failures.push({ index: offset + i, item, error: message });
+      });
+    }
+  }
+
+  return result;
+}
+
 /** Persists the order and initialises a single Paystack charge covering every recipient. */
 export async function createBulkGiftOrder(
   userId: string,
@@ -193,6 +264,41 @@ export async function getBulkGiftOrder(userId: string, id: string): Promise<Bulk
   };
 }
 
+/**
+ * Loads an order for invoice download, enforcing that the requesting user owns it.
+ * Throws 404 when the order does not exist and 403 when it belongs to someone else.
+ */
+export async function getBulkGiftOrderForInvoice(
+  userId: string,
+  id: string
+): Promise<BulkGiftOrder> {
+  const { rows } = await pool.query<{
+    id: string;
+    user_id: string;
+    payment_reference: string;
+    total_ngn: string;
+    items: BulkGiftItem[];
+    status: string;
+    created_at: Date;
+  }>("SELECT * FROM bulk_gift_orders WHERE id = $1", [id]);
+  const row = rows[0];
+  if (!row) {
+    throw new AppError(ERROR_CODES.NOT_FOUND, "Bulk gift order not found", 404);
+  }
+  if (row.user_id !== userId) {
+    throw new AppError(ERROR_CODES.FORBIDDEN, "You do not have access to this invoice", 403);
+  }
+  return {
+    id: row.id,
+    userId: row.user_id,
+    paymentReference: row.payment_reference,
+    totalNgn: Number(row.total_ngn),
+    items: row.items,
+    status: row.status,
+    createdAt: row.created_at,
+  };
+}
+
 /** Dedicated account manager contact shown to business accounts. */
 export function getAccountManagerContact() {
   return {
@@ -211,11 +317,21 @@ function escapePdfText(text: string): string {
     .replace(/\)/g, "\\)");
 }
 
+export interface InvoicePdfOptions {
+  /** Business name printed on the invoice; falls back to the app name. */
+  businessName?: string;
+  /** USDC equivalent of the order total. */
+  totalUsdc?: number;
+  /** VAT amount in NGN, if applicable. */
+  vatNgn?: number;
+}
+
 /** Builds a minimal single-page PDF invoice (monospace Courier, no external dependency). */
-export function generateInvoicePdf(order: BulkGiftOrder): Buffer {
+export function generateInvoicePdf(order: BulkGiftOrder, options: InvoicePdfOptions = {}): Buffer {
   const fmt = (n: number) => `NGN ${n.toLocaleString("en-NG")}`;
+  const businessName = options.businessName ?? serverConfig.app.name;
   const lines = [
-    `${serverConfig.app.name} - Invoice`,
+    `${businessName} - Invoice`,
     "",
     `Invoice #: ${order.id}`,
     `Payment reference: ${order.paymentReference}`,
@@ -231,8 +347,10 @@ export function generateInvoicePdf(order: BulkGiftOrder): Buffer {
       ),
     ...(order.items.length > 40 ? [`... and ${order.items.length - 40} more recipients`] : []),
     "",
-    `Recipients: ${order.items.length}`,
+    `Gift count: ${order.items.length}`,
     `Total: ${fmt(order.totalNgn)}`,
+    ...(options.totalUsdc !== undefined ? [`Total USDC: ${options.totalUsdc.toFixed(2)} USDC`] : []),
+    ...(options.vatNgn !== undefined ? [`VAT: ${fmt(options.vatNgn)}`] : []),
   ];
 
   const content = [

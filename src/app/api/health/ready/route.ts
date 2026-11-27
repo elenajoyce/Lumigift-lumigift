@@ -30,15 +30,26 @@ export async function GET() {
     checkHorizon(serverConfig.stellar.horizonUrl),
   ]);
 
-  const checks = { postgres, redis, horizon };
-  const degraded = Object.values(checks).some((s) => s === "error");
-  const status = degraded ? "degraded" : "ok";
-
   // Pool metrics are always included so operators can detect exhaustion
   const poolMetrics = getPoolMetrics();
 
+  // Treat a fully saturated pool (no idle connections and requests queued)
+  // as unready — the DB probe above can still succeed even when the pool
+  // has no spare capacity to serve new requests.
+  const poolExhausted = poolMetrics.waiting > 0 && poolMetrics.idle === 0;
+  const dbCheck = postgres === "ok" && poolExhausted ? "error" : postgres;
+
+  const checks = { db: dbCheck, redis, horizon };
+  const degraded = Object.values(checks).some((s) => s === "error");
+  const status = degraded ? "degraded" : "ok";
+
   return NextResponse.json(
-    { status, timestamp: new Date().toISOString(), postgres, redis, checks },
+    {
+      status,
+      timestamp: new Date().toISOString(),
+      checks,
+      metrics: { db: poolMetrics },
+    },
     { status: degraded ? 503 : 200 }
   );
 }

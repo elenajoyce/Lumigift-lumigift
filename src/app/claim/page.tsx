@@ -45,6 +45,8 @@ export default function ClaimDiscoveryPage() {
     if (!token || status === "loading") return;
 
     if (status === "unauthenticated") {
+      // The token is already in sessionStorage, so it survives the auth
+      // redirect and is picked up again once the user is authenticated.
       router.replace(`/auth/login?callbackUrl=${encodeURIComponent("/claim")}`);
       return;
     }
@@ -55,11 +57,15 @@ export default function ClaimDiscoveryPage() {
         const res = await fetch(`/api/v1/gifts/claim-token?token=${encodeURIComponent(token)}`);
         const json = await res.json();
         if (cancelled) return;
-        sessionStorage.removeItem(CLAIM_TOKEN_STORAGE_KEY);
         if (!json.success) throw new Error(json.error ?? "This claim link is invalid");
+        sessionStorage.removeItem(CLAIM_TOKEN_STORAGE_KEY);
         router.replace(`/gifts/${json.data.giftId}`);
       } catch (err) {
-        if (!cancelled) setError((err as Error).message);
+        if (cancelled) return;
+        // Clear the token on failure too, so a stale/invalid token is not
+        // retried on every subsequent visit to /claim.
+        sessionStorage.removeItem(CLAIM_TOKEN_STORAGE_KEY);
+        setError((err as Error).message);
       }
     })();
     return () => {

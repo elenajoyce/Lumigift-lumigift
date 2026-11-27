@@ -2,11 +2,65 @@
 
 import { useToast } from "@/components/ui/ToastContext";
 import { Button } from "@/components/ui/Button";
+import { useAnalytics } from "@/lib/analytics";
 import styles from "./ShareGift.module.css";
 
 interface ShareGiftProps {
   giftId: string;
   recipientName: string;
+}
+
+export interface ShareGiftPayload {
+  title: string;
+  text: string;
+  url: string;
+}
+
+export type ShareMethod = "web-share" | "clipboard";
+
+/**
+ * Feature-detects the Web Share API. Optionally verifies that the given
+ * payload is shareable via `navigator.canShare` when available.
+ */
+export function canUseWebShare(payload?: ShareGiftPayload): boolean {
+  if (typeof navigator === "undefined" || typeof navigator.share !== "function") {
+    return false;
+  }
+  if (payload && typeof navigator.canShare === "function") {
+    try {
+      return navigator.canShare(payload);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Shares the gift via the Web Share API when supported, otherwise falls back
+ * to copying the URL to the clipboard. Returns the method used, or `null` if
+ * the user dismissed the native sheet (no analytics fired in that case).
+ */
+export async function shareGift(
+  payload: ShareGiftPayload,
+  track: (event: string, props: Record<string, unknown>) => void,
+): Promise<ShareMethod | null> {
+  if (canUseWebShare(payload)) {
+    try {
+      await navigator.share({ title: payload.title, text: payload.text, url: payload.url });
+      track("gift_share", { method: "web-share" });
+      return "web-share";
+    } catch (err) {
+      // AbortError = user dismissed the sheet; fall through to clipboard.
+      if (err instanceof Error && err.name !== "AbortError") {
+        console.warn("[ShareGift] navigator.share failed:", err);
+      }
+    }
+  }
+
+  await navigator.clipboard.writeText(payload.url);
+  track("gift_share", { method: "clipboard" });
+  return "clipboard";
 }
 
 /**
@@ -24,6 +78,14 @@ function buildShareText(recipientName: string, claimUrl: string): string {
   return `🎁 You have a surprise gift waiting, ${recipientName}! Claim it here: ${claimUrl}`;
 }
 
+function buildSharePayload(recipientName: string, claimUrl: string): ShareGiftPayload {
+  return {
+    title: "Lumigift",
+    text: buildShareText(recipientName, claimUrl),
+    url: claimUrl,
+  };
+}
+
 /**
  * ShareGift — renders sharing options for a created gift.
  *
@@ -35,30 +97,18 @@ function buildShareText(recipientName: string, claimUrl: string): string {
  */
 export function ShareGift({ giftId, recipientName }: ShareGiftProps) {
   const { addToast } = useToast();
+  const track = useAnalytics();
 
   const claimUrl = buildClaimUrl(giftId);
-  const text = buildShareText(recipientName, claimUrl);
+  const payload = buildSharePayload(recipientName, claimUrl);
+  const text = payload.text;
 
   const handleShare = async () => {
-    // ── Primary: Web Share API (mobile native sheet) ─────────────────────────
-    if (typeof navigator !== "undefined" && navigator.share) {
-      try {
-        await navigator.share({ title: "Lumigift", text, url: claimUrl });
-        // User completed the share — no toast needed (native sheet is the feedback)
-        return;
-      } catch (err) {
-        // AbortError = user dismissed the sheet; fall through to clipboard.
-        // Any other error also falls through.
-        if (err instanceof Error && err.name !== "AbortError") {
-          console.warn("[ShareGift] navigator.share failed:", err);
-        }
-      }
-    }
-
-    // ── Fallback: clipboard copy ──────────────────────────────────────────────
     try {
-      await navigator.clipboard.writeText(claimUrl);
-      addToast("Gift link copied to clipboard!", "success");
+      const method = await shareGift(payload, track);
+      if (method === "clipboard") {
+        addToast("Gift link copied to clipboard!", "success");
+      }
     } catch {
       // Clipboard API unavailable (e.g. non-secure context in older browsers)
       addToast("Could not copy link. Please copy it manually.", "error");
@@ -67,6 +117,10 @@ export function ShareGift({ giftId, recipientName }: ShareGiftProps) {
 
   const whatsappUrl = `https://wa.me/?text=${encodeURIComponent(text)}`;
   const smsUrl = `sms:?body=${encodeURIComponent(text)}`;
+
+  const trackChannel = (channel: string) => {
+    track("gift_share", { method: channel });
+  };
 
   return (
     <div className={styles.container}>
@@ -80,11 +134,17 @@ export function ShareGift({ giftId, recipientName }: ShareGiftProps) {
         rel="noopener noreferrer"
         className={styles.link}
         aria-label="Share on WhatsApp"
+        onClick={() => trackChannel("whatsapp")}
       >
         WhatsApp
       </a>
 
-      <a href={smsUrl} className={styles.link} aria-label="Share via SMS">
+      <a
+        href={smsUrl}
+        className={styles.link}
+        aria-label="Share via SMS"
+        onClick={() => trackChannel("sms")}
+      >
         SMS
       </a>
     </div>

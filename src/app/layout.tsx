@@ -7,6 +7,7 @@ import "@/styles/components.css";
 import { Navbar } from "@/components/layout/Navbar";
 import { TestnetBanner } from "@/components/ui/TestnetBanner";
 import { ServiceWorkerRegister } from "@/components/ui/ServiceWorkerRegister";
+import { InstallPrompt } from "@/components/ui/InstallPrompt";
 import { Providers } from "./providers";
 
 const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
@@ -66,7 +67,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
         <script
           nonce={nonce}
           dangerouslySetInnerHTML={{
-            __html: `(function(){try{var t=localStorage.getItem('theme');if(t==='light'||t==='dark'){document.documentElement.setAttribute('data-theme',t);}else if(window.matchMedia('(prefers-color-scheme: light)').matches){document.documentElement.setAttribute('data-theme','light');}}catch(e){}})();`,
+            __html: `(function(){try{var t=localStorage.getItem('theme');if(t!=='light'&&t!=='dark'){t=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';}document.documentElement.setAttribute('data-theme',t);}catch(e){document.documentElement.setAttribute('data-theme','light');}})();`,
           }}
         />
       </head>
@@ -79,7 +80,20 @@ export default async function RootLayout({ children }: { children: React.ReactNo
           <Navbar />
           <TestnetBanner />
           <ServiceWorkerRegister />
+          <InstallPrompt />
           <main id="main-content">{children}</main>
+          <footer className="site-footer">
+            <nav aria-label="Footer">
+              <a
+                href="https://status.lumigift.app"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="site-footer__link"
+              >
+                Service Status
+              </a>
+            </nav>
+          </footer>
         </Providers>
       </body>
     </html>

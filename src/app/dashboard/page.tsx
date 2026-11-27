@@ -1,7 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { VirtualGiftList } from "@/components/gift/VirtualGiftList";
 import { GiftCardSkeleton } from "@/components/gift/GiftCardSkeleton";
@@ -12,15 +13,41 @@ import type { GiftAnalytics, GiftPage } from "@/server/services/gift.service";
 import { formatNGN } from "@/lib/currency";
 
 const PAGE_SIZE = 10;
+const SEARCH_DEBOUNCE_MS = 300;
 const DATE_FORMATTER = new Intl.DateTimeFormat(undefined, {
   year: "numeric",
   month: "short",
   day: "numeric",
 });
 
-async function fetchGiftsCursor(cursor: string | null, pageSize: number): Promise<GiftPage> {
+const STATUS_FILTERS = [
+  { value: "", label: "All" },
+  { value: "pending", label: "Pending" },
+  { value: "funded", label: "Funded" },
+  { value: "claimed", label: "Claimed" },
+  { value: "cancelled", label: "Cancelled" },
+] as const;
+
+type StatusFilter = (typeof STATUS_FILTERS)[number]["value"];
+
+function normalizeStatus(value: string | null): StatusFilter {
+  const match = STATUS_FILTERS.find((option) => option.value === value);
+  return match ? match.value : "";
+}
+
+async function fetchGiftsCursor(
+  cursor: string | null,
+  pageSize: number,
+  search: string,
+  status: StatusFilter,
+): Promise<GiftPage> {
   const params = new URLSearchParams({ pageSize: String(pageSize) });
   if (cursor) params.set("cursor", cursor);
+  if (search) {
+    params.set("search", search);
+    params.set("q", search);
+  }
+  if (status) params.set("status", status);
   const res = await fetch(`/api/v1/gifts?${params.toString()}`);
   const json: ApiResponse<GiftPage> = await res.json();
   if (!json.success) throw new Error(json.error);
@@ -54,16 +81,83 @@ function statusLabel(status: GiftAnalytics["gifts"][number]["status"]): string {
 }
 
 export default function DashboardPage() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
+  const urlSearch = searchParams.get("search") ?? "";
+  const urlStatus = normalizeStatus(searchParams.get("status"));
+
+  // Local search input state, debounced before it hits the URL/query.
+  const [searchInput, setSearchInput] = useState(urlSearch);
+  const [search, setSearch] = useState(urlSearch);
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>(urlStatus);
+
   // Stack of cursors visited — index 0 is always null (first page).
   const [cursorStack, setCursorStack] = useState<Array<string | null>>([null]);
   const [stackIndex, setStackIndex] = useState(0);
 
   const cursor = cursorStack[stackIndex];
   const pageNumber = stackIndex + 1;
+  const hasActiveFilters = search.length > 0 || statusFilter !== "";
+
+  // Keep local state in sync when the URL changes (back/forward, shared links).
+  const lastUrlRef = useRef({ search: urlSearch, status: urlStatus });
+  useEffect(() => {
+    const last = lastUrlRef.current;
+    if (last.search === urlSearch && last.status === urlStatus) return;
+    lastUrlRef.current = { search: urlSearch, status: urlStatus };
+    setSearchInput(urlSearch);
+    setSearch(urlSearch);
+    setStatusFilter(urlStatus);
+    setCursorStack([null]);
+    setStackIndex(0);
+  }, [urlSearch, urlStatus]);
+
+  // Debounce the search input (300ms) before applying it.
+  useEffect(() => {
+    if (searchInput === search) return;
+    const timer = setTimeout(() => {
+      setSearch(searchInput);
+      setCursorStack([null]);
+      setStackIndex(0);
+    }, SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [searchInput, search]);
+
+  // Reflect filter state in the URL (shareable/bookmarkable).
+  useEffect(() => {
+    const params = new URLSearchParams(searchParams.toString());
+    if (search) params.set("search", search);
+    else params.delete("search");
+    if (statusFilter) params.set("status", statusFilter);
+    else params.delete("status");
+
+    const next = params.toString();
+    const current = searchParams.toString();
+    if (next === current) return;
+
+    lastUrlRef.current = { search, status: statusFilter };
+    router.replace(next ? `${pathname}?${next}` : pathname, { scroll: false });
+  }, [search, statusFilter, pathname, router, searchParams]);
+
+  function handleStatusChange(value: StatusFilter) {
+    setStatusFilter(value);
+    setCursorStack([null]);
+    setStackIndex(0);
+  }
+
+  function clearFilters() {
+    setSearchInput("");
+    setSearch("");
+    setStatusFilter("");
+    setCursorStack([null]);
+    setStackIndex(0);
+  }
 
   const { data, status, isFetching, isStale, refetch } = useQuery({
-    queryKey: ["gifts", "cursor", cursor],
-    queryFn: () => fetchGiftsCursor(cursor, PAGE_SIZE),
+    queryKey: ["gifts", "cursor", cursor, search, statusFilter],
+    queryFn: () => fetchGiftsCursor(cursor, PAGE_SIZE, search, statusFilter),
   });
   const {
     data: analytics,
@@ -97,14 +191,14 @@ export default function DashboardPage() {
         <div className="container">
           <OfflineBanner />
           <h1 className={styles.title}>Your Gifts</h1>
-          {/* Issue #279: aria-busy + aria-label on skeleton wrapper; default 3 cards */}
+          {/* Issue #279, #465: aria-busy + aria-label on skeleton wrapper; count matches PAGE_SIZE to prevent layout shift */}
           <div
             className={styles.grid}
             aria-live="polite"
             aria-busy="true"
             aria-label="Loading gifts"
           >
-            <GiftCardSkeleton count={3} />
+            <GiftCardSkeleton count={PAGE_SIZE} />
           </div>
         </div>
       </div>
@@ -254,6 +348,53 @@ export default function DashboardPage() {
           </p>
         )}
 
+        <div className={styles.filters} role="search" aria-label="Filter gifts">
+          <div className={styles.searchField}>
+            <label htmlFor="gift-search" className={styles.filterLabel}>
+              Search gifts
+            </label>
+            <input
+              id="gift-search"
+              type="search"
+              className={styles.searchInput}
+              placeholder="Search by recipient, message, or amount…"
+              value={searchInput}
+              onChange={(event) => setSearchInput(event.target.value)}
+              aria-label="Search gifts"
+            />
+          </div>
+
+          <div className={styles.statusField}>
+            <label htmlFor="gift-status" className={styles.filterLabel}>
+              Status
+            </label>
+            <select
+              id="gift-status"
+              className={styles.statusSelect}
+              value={statusFilter}
+              onChange={(event) => handleStatusChange(event.target.value as StatusFilter)}
+              aria-label="Filter gifts by status"
+            >
+              {STATUS_FILTERS.map((option) => (
+                <option key={option.value || "all"} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {hasActiveFilters && (
+            <button
+              type="button"
+              className="btn btn--secondary"
+              onClick={clearFilters}
+              aria-label="Clear gift filters"
+            >
+              Clear filters
+            </button>
+          )}
+        </div>
+
         {gifts.length === 0 && stackIndex === 0 ? (
           // ── Empty state ───────────────────────────────────────────────────
           <div className={styles.empty} role="status" aria-label="No gifts found">
@@ -275,13 +416,27 @@ export default function DashboardPage() {
                 <path d="M7.5 8a2.5 2.5 0 0 1 0-5A4.8 8 0 0 1 12 8a4.8 8 0 0 1 4.5-5 2.5 2.5 0 0 1 0 5" />
               </svg>
             </div>
-            <h2 className={styles.emptyTitle}>No gifts yet</h2>
-            <p className={styles.emptyDescription}>
-              Brighten someone&apos;s day by sending a surprise cash gift!
-            </p>
-            <Link href="/send" className="btn btn--primary">
-              Send your first gift!
-            </Link>
+            {hasActiveFilters ? (
+              <>
+                <h2 className={styles.emptyTitle}>No matching gifts</h2>
+                <p className={styles.emptyDescription}>
+                  No gifts match your search or filter. Try adjusting your filters.
+                </p>
+                <button type="button" className="btn btn--secondary" onClick={clearFilters}>
+                  Clear filters
+                </button>
+              </>
+            ) : (
+              <>
+                <h2 className={styles.emptyTitle}>No gifts yet</h2>
+                <p className={styles.emptyDescription}>
+                  Brighten someone&apos;s day by sending a surprise cash gift!
+                </p>
+                <Link href="/send" className="btn btn--primary">
+                  Send your first gift!
+                </Link>
+              </>
+            )}
           </div>
         ) : (
           <>

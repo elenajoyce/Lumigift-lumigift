@@ -1,5 +1,5 @@
 /**
- * Toast accessibility tests (#42)
+ * Toast accessibility tests (#42, #468)
  *
  * Verifies that:
  * - Error/warning toasts use role="alert" (assertive)
@@ -7,12 +7,16 @@
  * - Each toast has aria-atomic="true"
  * - Severity labels are present for screen readers (sr-only text)
  * - Dismiss button has a descriptive aria-label
+ * - No axe-core violations (jest-axe)
  */
 
 import React from "react";
 import { render, screen, fireEvent } from "@testing-library/react";
+import { axe, toHaveNoViolations } from "jest-axe";
 import { ToastProvider, useToast } from "../ToastContext";
 import { Toaster } from "../Toaster";
+
+expect.extend(toHaveNoViolations);
 
 // Helper component that triggers toasts via useToast
 function ToastTrigger({
@@ -23,11 +27,7 @@ function ToastTrigger({
   variant: "success" | "error" | "warning" | "info";
 }) {
   const { addToast } = useToast();
-  return (
-    <button onClick={() => addToast(message, variant)}>
-      Add {variant} toast
-    </button>
-  );
+  return <button onClick={() => addToast(message, variant)}>Add {variant} toast</button>;
 }
 
 function TestApp({
@@ -113,9 +113,7 @@ describe("Toaster accessibility", () => {
   it("dismiss button has a descriptive aria-label for error", () => {
     render(<TestApp message="Network error" variant="error" />);
     addToast("Network error", "error");
-    expect(
-      screen.getByRole("button", { name: /dismiss error notification/i })
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /dismiss error notification/i })).toBeInTheDocument();
   });
 
   it("dismiss button has a descriptive aria-label for success", () => {
@@ -141,5 +139,23 @@ describe("Toaster accessibility", () => {
       </ToastProvider>
     );
     expect(screen.getByLabelText("Notifications")).toBeInTheDocument();
+  });
+
+  it("has no axe-core violations with multiple toasts", async () => {
+    const { container } = render(
+      <ToastProvider>
+        <ToastTrigger message="Success message" variant="success" />
+        <ToastTrigger message="Error message" variant="error" />
+        <ToastTrigger message="Warning message" variant="warning" />
+        <ToastTrigger message="Info message" variant="info" />
+        <Toaster />
+      </ToastProvider>
+    );
+    addToast("Success message", "success");
+    addToast("Error message", "error");
+    addToast("Warning message", "warning");
+    addToast("Info message", "info");
+    const results = await axe(container);
+    expect(results).toHaveNoViolations();
   });
 });

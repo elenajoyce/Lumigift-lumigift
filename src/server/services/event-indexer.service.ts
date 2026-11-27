@@ -28,6 +28,8 @@ import pool from "@/lib/db";
 import { serverConfig } from "@/server/config";
 import { fetchEscrowEvents, CURSOR_GENESIS, type EscrowEvent } from "@/lib/contracts/escrow-events";
 import { getGiftByContractId, updateGiftStatusIdempotent } from "./gift.service";
+import type { Gift } from "./gift.db";
+import { sendNotification, NotificationChannel } from "./notification.service";
 
 const CURSOR_KEY = "escrow:event:cursor";
 const INDEXER_NAME = "escrow";
@@ -176,6 +178,11 @@ async function applyEvent(event: EscrowEvent): Promise<EventOutcome> {
             await updateGiftStatusIdempotent(gift.id, "locked");
             console.log(`[event-indexer] initialized → locked  gift=${gift.id} tx=${event.txHash}`);
             outcome = "applied";
+            // GiftFunded: notify recipient (issue #517). Fire-and-forget — never
+            // block event application on notification delivery.
+            notifyGiftFunded(gift, event.txHash).catch((err: unknown) =>
+              console.error("[event-indexer] GiftFunded notification failed:", err)
+            );
           }
           break;
         }
@@ -187,6 +194,10 @@ async function applyEvent(event: EscrowEvent): Promise<EventOutcome> {
             await updateGiftStatusIdempotent(gift.id, "claimed");
             console.log(`[event-indexer] claimed → claimed  gift=${gift.id} tx=${event.txHash}`);
             outcome = "applied";
+            // GiftClaimed: notify sender (issue #517). Fire-and-forget.
+            notifyGiftClaimed(gift, event.txHash).catch((err: unknown) =>
+              console.error("[event-indexer] GiftClaimed notification failed:", err)
+            );
           }
           break;
         }
@@ -196,7 +207,9 @@ async function applyEvent(event: EscrowEvent): Promise<EventOutcome> {
             outcome = "skipped";
           } else {
             await updateGiftStatusIdempotent(gift.id, "cancelled");
-            console.log(`[event-indexer] cancelled → cancelled  gift=${gift.id} tx=${event.txHash}`);
+            console.log(
+              `[event-indexer] cancelled → cancelled  gift=${gift.id} tx=${event.txHash} reason=${event.reason}`
+            );
             outcome = "applied";
           }
           break;
@@ -286,6 +299,56 @@ function buildPayload(event: EscrowEvent): Record<string, unknown> {
         type: event.type,
         sender: event.sender,
         amount: event.amount.toString(),
+        reason: event.reason,
       };
   }
+}
+
+// ─── Event-to-notification dispatch (issue #517) ──────────────────────────────
+
+/**
+ * Notifies the sender via SMS that their gift has been claimed on-chain.
+ * Idempotent: dedup key is the event's tx hash, so a replayed event never
+ * double-sends. Delivery retries (up to 3 attempts) are handled inside
+ * `sendNotification`.
+ */
+async function notifyGiftClaimed(gift: Gift, txHash: string): Promise<void> {
+  const { rows } = await pool.query<{ phone: string }>(
+    "SELECT phone FROM users WHERE id = $1",
+    [gift.senderId]
+  );
+  const senderPhone = rows[0]?.phone;
+  if (!senderPhone) return;
+
+  await sendNotification(
+    NotificationChannel.Sms,
+    {
+      type: "gift_claimed",
+      phone: senderPhone,
+      recipientName: gift.recipientName,
+      amountUsdc: gift.amountUsdc,
+    },
+    { dedupKey: `event-indexer:claimed:${txHash}` }
+  );
+}
+
+/**
+ * Notifies the recipient via email that their gift has been funded on-chain.
+ * Idempotent: dedup key is the event's tx hash.
+ */
+async function notifyGiftFunded(gift: Gift, txHash: string): Promise<void> {
+  if (!gift.recipientEmail) return;
+
+  await sendNotification(
+    NotificationChannel.Email,
+    {
+      type: "gift_received",
+      to: gift.recipientEmail,
+      data: {
+        recipientName: gift.recipientName,
+        amountNgn: gift.amountNgn,
+      },
+    },
+    { dedupKey: `event-indexer:funded:${txHash}` }
+  );
 }
